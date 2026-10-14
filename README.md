@@ -1,3 +1,9 @@
+> **Library migration in progress:** `wbridge/` now contains the one-sided
+> transfer implementation imported from Monarch PR #4758. Existing examples,
+> tests, and documentation below target the previous API and require migration.
+> Read [migration notes](docs/library-import.md) and
+> [license/provenance notices](THIRD_PARTY_NOTICES.md) before integration.
+
 # WeightBridge
 
 WeightBridge is an RL weight transfer library for moving sharded model weights from Trainer Workers to Rollout Workers when the two sides use different parameter names, tensor layouts, or parallelism strategies. It infers how HuggingFace checkpoint tensors map into each runtime, computes sender/receiver shard overlaps, and transfers only the needed slices through PyTorch P2P.

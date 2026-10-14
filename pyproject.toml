@@ -8,14 +8,22 @@ version = "0.1.0"
 description = "WeightBridge"
 readme = "README.md"
 requires-python = ">=3.10"
+license = {file = "LICENSE"}
 dependencies = [
     "torch",
     "pyzmq",
-    "fastapi",
+    "packaging",
 ]
 
 [project.optional-dependencies]
-dev = []
+cuda = ["cuda-python>=12.6"]
+mooncake = ["mooncake-transfer-engine>=0.3.12.post1,<0.4"]
+checkpoints = ["safetensors"]
+test = ["pytest"]
+dev = ["pytest"]
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 
 [tool.setuptools.packages.find]
 where = ["."]
