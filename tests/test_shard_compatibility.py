@@ -1,33 +1,48 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Tests for _check_shard_compatibility, ShardSpec.compute_overlap, and BoundShardSpec pack/unpack."""
 
 import torch
-
-from wbridge.utils.data import ShardSpec, _check_shard_compatibility
+from wbridge.utils.data import _check_shard_compatibility, ShardSpec
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_shard_spec(shard):
     """Single-entry :class:`~wbridge.utils.data.ShardSpec` (one tensor name)."""
-    return ShardSpec({
-        "weight": [shard],
-    })
+    return ShardSpec(
+        {
+            "weight": [shard],
+        }
+    )
 
 
 def _tensor_for_shard(shard, dtype=torch.float32):  # torch dtype for tensors
     numel = 1
     for l, r, w in shard:
         numel *= r - l
-    return torch.arange(numel, dtype=dtype).reshape(
-        tuple(r - l for l, r, w in shard)
+    return torch.arange(numel, dtype=dtype).reshape(tuple(r - l for l, r, w in shard))
+
+
+def _alignment_shards(alignment):
+    """Split the production alignment tuples into the two equivalent shard views used in assertions."""
+    return (
+        [(sl, sr, width) for sl, sr, _rl, _rr, width in alignment],
+        [(rl, rr, width) for _sl, _sr, rl, rr, width in alignment],
     )
 
 
 # ---------------------------------------------------------------------------
 # _check_shard_compatibility tests
 # ---------------------------------------------------------------------------
+
 
 class TestCheckShardCompatibility:
     """Unit tests for _check_shard_compatibility."""
@@ -38,7 +53,7 @@ class TestCheckShardCompatibility:
         r = [(2, 3, 4), (1, 5, 6)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert aligned_s == [(0, 4, 4), (0, 6, 6)]
         assert aligned_r == [(2, 3, 4), (1, 5, 6)]
 
@@ -48,7 +63,7 @@ class TestCheckShardCompatibility:
         r = [(0, 4, 4), (0, 6, 6)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [4, 6]
         assert [w for _, _, w in aligned_r] == [4, 6]
         assert aligned_s == [(0, 4, 4), (0, 6, 6)]
@@ -60,7 +75,7 @@ class TestCheckShardCompatibility:
         r = [(0, 24, 24)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert aligned_s == [(0, 4, 4), (0, 6, 6)]
         assert aligned_r == [(0, 4, 4), (0, 6, 6)]
 
@@ -70,7 +85,7 @@ class TestCheckShardCompatibility:
         r = [(0, 4, 4), (0, 6, 6)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert aligned_s == [(1, 2, 4), (0, 6, 6)]
         assert aligned_r == [(0, 4, 4), (0, 6, 6)]
 
@@ -80,7 +95,7 @@ class TestCheckShardCompatibility:
         r = [(0, 4, 4), (0, 6, 6)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert aligned_s == [(0, 1, 4), (1, 5, 6)]
         assert aligned_r == [(0, 4, 4), (0, 6, 6)]
 
@@ -90,7 +105,7 @@ class TestCheckShardCompatibility:
         r = [(7, 11, 24)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert aligned_s == [(0, 4, 4), (0, 6, 6)]
         assert aligned_r == [(1, 2, 4), (1, 5, 6)]
 
@@ -100,7 +115,7 @@ class TestCheckShardCompatibility:
         r = [(0, 2, 2), (0, 3, 3), (0, 4, 4)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [2, 3, 4]
         assert aligned_s == [(0, 1, 2), (1, 2, 3), (0, 4, 4)]
         assert aligned_r == [(0, 2, 2), (0, 3, 3), (0, 4, 4)]
@@ -123,7 +138,7 @@ class TestCheckShardCompatibility:
         r = [(2, 4, 4), (0, 4, 6)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert aligned_s == [(1, 3, 4), (2, 5, 6)]
         assert aligned_r == [(2, 4, 4), (0, 4, 6)]
 
@@ -133,7 +148,7 @@ class TestCheckShardCompatibility:
         r = [(0, 24, 24)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert aligned_s == [(0, 2, 2), (0, 3, 3), (0, 4, 4)]
         assert aligned_r == [(0, 2, 2), (0, 3, 3), (0, 4, 4)]
 
@@ -143,7 +158,7 @@ class TestCheckShardCompatibility:
         r = [(4, 9, 10)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert aligned_s == [(2, 7, 10)]
         assert aligned_r == [(4, 9, 10)]
 
@@ -199,7 +214,7 @@ class TestCheckShardCompatibility:
         r = [(0, 2, 2), (0, 4, 4), (0, 3, 3)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [2, 2, 2, 3]
         assert [w for _, _, w in aligned_r] == [2, 2, 2, 3]
         assert aligned_s == [(0, 2, 2), (0, 2, 2), (0, 2, 2), (0, 3, 3)]
@@ -211,7 +226,7 @@ class TestCheckShardCompatibility:
         r = [(0, 2, 2), (0, 12, 12)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [2, 2, 6]
         assert aligned_s == [(0, 2, 2), (0, 2, 2), (0, 6, 6)]
         assert aligned_r == [(0, 2, 2), (0, 2, 2), (0, 6, 6)]
@@ -222,7 +237,7 @@ class TestCheckShardCompatibility:
         r = [(0, 6, 6), (0, 4, 4)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [3, 2, 4]
         assert aligned_s == [(0, 3, 3), (0, 2, 2), (0, 4, 4)]
         assert aligned_r == [(0, 3, 3), (0, 2, 2), (0, 4, 4)]
@@ -233,7 +248,7 @@ class TestCheckShardCompatibility:
         r = [(2, 4, 6), (0, 4, 4)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [3, 2, 4]
         assert aligned_s == [(1, 3, 3), (0, 2, 2), (1, 3, 4)]
         assert aligned_r == [(1, 2, 3), (0, 2, 2), (0, 4, 4)]
@@ -244,7 +259,7 @@ class TestCheckShardCompatibility:
         r = [(0, 4, 4), (0, 6, 6)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [4, 2, 3]
         assert aligned_s == [(1, 3, 4), (0, 2, 2), (0, 3, 3)]
         assert aligned_r == [(0, 4, 4), (0, 2, 2), (0, 3, 3)]
@@ -255,7 +270,7 @@ class TestCheckShardCompatibility:
         r = [(0, 4, 4), (0, 3, 3), (0, 2, 2)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [2, 2, 3, 2]
         assert aligned_s == [(0, 2, 2), (0, 2, 2), (0, 3, 3), (0, 2, 2)]
         assert aligned_r == [(0, 2, 2), (0, 2, 2), (0, 3, 3), (0, 2, 2)]
@@ -266,7 +281,7 @@ class TestCheckShardCompatibility:
         r = [(0, 2, 2), (0, 3, 3), (0, 2, 2), (0, 4, 4)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [2, 3, 2, 4]
         assert aligned_s == [(0, 2, 2), (0, 3, 3), (0, 2, 2), (0, 4, 4)]
 
@@ -276,7 +291,7 @@ class TestCheckShardCompatibility:
         r = [(0, 2, 2), (0, 3, 3), (0, 2, 2), (0, 4, 4)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [2, 3, 2, 4]
         assert aligned_s == [(0, 1, 2), (0, 3, 3), (0, 2, 2), (0, 4, 4)]
 
@@ -286,7 +301,7 @@ class TestCheckShardCompatibility:
         r = [(0, 2, 2), (2, 4, 4), (0, 3, 3)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [2, 2, 2, 3]
         assert aligned_s == [(0, 2, 2), (0, 2, 2), (0, 2, 2), (0, 3, 3)]
         assert aligned_r == [(0, 2, 2), (1, 2, 2), (0, 2, 2), (0, 3, 3)]
@@ -297,7 +312,7 @@ class TestCheckShardCompatibility:
         r = [(0, 2, 2), (6, 12, 12)]
         result = _check_shard_compatibility(s, r)
         assert result is not None
-        aligned_s, aligned_r = result
+        aligned_s, aligned_r = _alignment_shards(result)
         assert [w for _, _, w in aligned_s] == [2, 2, 6]
         assert aligned_s == [(0, 2, 2), (0, 2, 2), (0, 6, 6)]
         assert aligned_r == [(0, 2, 2), (1, 2, 2), (0, 6, 6)]
@@ -306,6 +321,7 @@ class TestCheckShardCompatibility:
 # ---------------------------------------------------------------------------
 # compute_overlap (spec only)
 # ---------------------------------------------------------------------------
+
 
 class TestComputeOverlap:
     def test_same_dims_partial_overlap(self):
@@ -327,10 +343,27 @@ class TestComputeOverlap:
         overlap = ShardSpec.compute_overlap(sender, receiver)
         assert len(overlap.entries) == 0
 
+    def test_explicit_names_limit_work_and_ignore_missing_names(self):
+        sender = ShardSpec(
+            {
+                "keep": [[(0, 4, 4)]],
+                "skip": [[(0, 4, 4)]],
+            }
+        )
+        receiver = ShardSpec(
+            {
+                "keep": [[(2, 4, 4)]],
+                "skip": [[(0, 4, 4)]],
+            }
+        )
+        overlap = ShardSpec.compute_overlap(sender, receiver, iter(("missing", "keep")))
+        assert overlap.entries == {"keep": [[(2, 4, 4)]]}
+
 
 # ---------------------------------------------------------------------------
 # BoundShardSpec pack / unpack via __getitem__ / __setitem__
 # ---------------------------------------------------------------------------
+
 
 class TestPackFor:
     def test_full_shard_roundtrip(self):
@@ -343,3 +376,25 @@ class TestPackFor:
         t_out = torch.zeros_like(t)
         receiver({"weight": t_out})[{0: overlap}] = {0: packed}
         assert torch.equal(t_out, t)
+
+    def test_setitem_named_pairs_filters_without_rebasing_wire_names(self):
+        """A fused destination may select B from an original [A,B] wire layout; B must not read A's bytes."""
+        full = ShardSpec(
+            {
+                "a": [[(0, 4, 4)]],
+                "b": [[(0, 3, 3)]],
+            }
+        )
+        selected = full.subset({"b"})
+        named_source = {
+            "a": torch.arange(4, dtype=torch.float32) + 10,
+            "b": torch.arange(3, dtype=torch.float32) + 100,
+        }
+        out = torch.zeros(3, dtype=torch.float32)
+        pairs = selected({"b": out}).setitem_named_pairs(
+            {0: selected},
+            {0: named_source},
+        )
+        for dst, src in pairs:
+            dst.copy_(src)
+        assert torch.equal(out, named_source["b"])

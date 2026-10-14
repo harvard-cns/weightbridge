@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """
 One decoder-block Qwen2-style toy (no ``model.layers.N`` in HF keys).
 
@@ -19,20 +25,17 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 
 __all__ = [
     "DEFAULT_QWEN_TINY_CONFIG",
     "QwenTinyConfig",
-    "trainer_load_spec_path",
     "build_trainer_wksd",
     "build_qwen_tiny_hf_checkpoint",
     "build_rollout_wksd",
     "make_trainer_load_weights",
     "make_rollout_load_weights",
-    "rollout_load_spec_path",
 ]
 
 
@@ -104,7 +107,9 @@ def _scatter_rows(
         return
     sr = src_row_offset + (a - block_global_lo)
     dr = a - shard_global_lo
-    dst_shard[dr : dr + (b - a)].copy_(src[sr : sr + (b - a)].to(device=device, dtype=dtype))
+    dst_shard[dr : dr + (b - a)].copy_(
+        src[sr : sr + (b - a)].to(device=device, dtype=dtype)
+    )
 
 
 def _trainer_scatter_megatron_qkv(
@@ -124,7 +129,9 @@ def _trainer_scatter_megatron_qkv(
         q = w["self_attn.q_proj.weight"]
         for g in range(n_g):
             gr = g * (vpg + 2) * d
-            _scatter_rows(dst, lo, part, q, g * vpg * d, gr, vpg * d, device=device, dtype=dtype)
+            _scatter_rows(
+                dst, lo, part, q, g * vpg * d, gr, vpg * d, device=device, dtype=dtype
+            )
     if "self_attn.k_proj.weight" in w:
         k = w["self_attn.k_proj.weight"]
         for g in range(n_g):
@@ -190,7 +197,10 @@ def build_trainer_wksd(
     tp_size: int = 1,
 ) -> dict[str, torch.Tensor]:
     del tp_rank
-    return {k: torch.empty(s, dtype=dtype, device=device) for k, s in _actor_shapes(cfg, tp_size).items()}
+    return {
+        k: torch.empty(s, dtype=dtype, device=device)
+        for k, s in _actor_shapes(cfg, tp_size).items()
+    }
 
 
 def trainer_load_weights(
@@ -213,31 +223,74 @@ def trainer_load_weights(
     if "model.embed_tokens.weight" in w:
         vp = cfg.vocab_size // tp_size
         sl = slice(tp_rank * vp, (tp_rank + 1) * vp)
-        wksd["embedding.word_embeddings.weight"].copy_(w["model.embed_tokens.weight"][sl].to(device=device, dtype=dtype))
+        wksd["embedding.word_embeddings.weight"].copy_(
+            w["model.embed_tokens.weight"][sl].to(device=device, dtype=dtype)
+        )
 
-    if any(k in w for k in ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight")):
+    if any(
+        k in w
+        for k in (
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+        )
+    ):
         _trainer_scatter_megatron_qkv(
-            wksd["self_attention.linear_qkv.weight"], cfg, tp_rank, tp_size, w, device=device, dtype=dtype
+            wksd["self_attention.linear_qkv.weight"],
+            cfg,
+            tp_rank,
+            tp_size,
+            w,
+            device=device,
+            dtype=dtype,
         )
 
     if "self_attn.o_proj.weight" in w:
         o = w["self_attn.o_proj.weight"]
         c0, c1 = tp_rank * q0, (tp_rank + 1) * q0
-        wksd["self_attention.linear_proj.weight"].copy_(o[:, c0:c1].to(device=device, dtype=dtype))
+        wksd["self_attention.linear_proj.weight"].copy_(
+            o[:, c0:c1].to(device=device, dtype=dtype)
+        )
 
     if "mlp.gate_proj.weight" in w:
-        _scatter_rows(wksd["mlp.linear_fc1.weight"], fc1_lo, fc1_part, w["mlp.gate_proj.weight"], 0, 0, iq, device=device, dtype=dtype)
+        _scatter_rows(
+            wksd["mlp.linear_fc1.weight"],
+            fc1_lo,
+            fc1_part,
+            w["mlp.gate_proj.weight"],
+            0,
+            0,
+            iq,
+            device=device,
+            dtype=dtype,
+        )
     if "mlp.up_proj.weight" in w:
-        _scatter_rows(wksd["mlp.linear_fc1.weight"], fc1_lo, fc1_part, w["mlp.up_proj.weight"], 0, iq, iq, device=device, dtype=dtype)
+        _scatter_rows(
+            wksd["mlp.linear_fc1.weight"],
+            fc1_lo,
+            fc1_part,
+            w["mlp.up_proj.weight"],
+            0,
+            iq,
+            iq,
+            device=device,
+            dtype=dtype,
+        )
 
     if "mlp.down_proj.weight" in w:
         c0, c1 = tp_rank * i0, (tp_rank + 1) * i0
-        wksd["mlp.linear_fc2.weight"].copy_(w["mlp.down_proj.weight"][:, c0:c1].to(device=device, dtype=dtype))
+        wksd["mlp.linear_fc2.weight"].copy_(
+            w["mlp.down_proj.weight"][:, c0:c1].to(device=device, dtype=dtype)
+        )
 
     if "input_layernorm.weight" in w:
-        wksd["self_attention.linear_qkv.layer_norm_weight"].copy_(w["input_layernorm.weight"].to(device=device, dtype=dtype))
+        wksd["self_attention.linear_qkv.layer_norm_weight"].copy_(
+            w["input_layernorm.weight"].to(device=device, dtype=dtype)
+        )
     if "post_attention_layernorm.weight" in w:
-        wksd["mlp.linear_fc1.layer_norm_weight"].copy_(w["post_attention_layernorm.weight"].to(device=device, dtype=dtype))
+        wksd["mlp.linear_fc1.layer_norm_weight"].copy_(
+            w["post_attention_layernorm.weight"].to(device=device, dtype=dtype)
+        )
 
 
 def make_trainer_load_weights(
@@ -252,7 +305,9 @@ def make_trainer_load_weights(
     dev = torch.device(device)
 
     def lw(it: Iterable[tuple[str, torch.Tensor]]) -> None:
-        trainer_load_weights(it, wksd, cfg, device=dev, dtype=dtype, tp_rank=tp_rank, tp_size=tp_size)
+        trainer_load_weights(
+            it, wksd, cfg, device=dev, dtype=dtype, tp_rank=tp_rank, tp_size=tp_size
+        )
 
     return lw
 
@@ -267,7 +322,9 @@ def _rollout_shapes(cfg: QwenTinyConfig, tp: int) -> dict[str, tuple[int, ...]]:
         "self_attn.qkv_proj.weight": (qkv_r, h),
         "self_attn.o_proj.weight": (h, q_loc),
         "mlp.gate_up_proj.weight": (2 * iq // tp, h),
-        "mlp.down_proj.weight": (h, iq // tp),
+        # down_proj stored TRANSPOSED (in, out) — mimics a Megatron RowParallel weight; forces the
+        # LoadSpec to carry a transpose (negative w) so the transfer path must handle it.
+        "mlp.down_proj.weight": (iq // tp, h),
         "input_layernorm.weight": (h,),
         "post_attention_layernorm.weight": (h,),
     }
@@ -282,7 +339,10 @@ def build_rollout_wksd(
     tp_size: int = 1,
 ) -> dict[str, torch.Tensor]:
     del tp_rank
-    return {k: torch.empty(s, dtype=dtype, device=device) for k, s in _rollout_shapes(cfg, tp_size).items()}
+    return {
+        k: torch.empty(s, dtype=dtype, device=device)
+        for k, s in _rollout_shapes(cfg, tp_size).items()
+    }
 
 
 def rollout_load_weights(
@@ -305,38 +365,75 @@ def rollout_load_weights(
     if "model.embed_tokens.weight" in w:
         vp = cfg.vocab_size // tp_size
         sl = slice(tp_rank * vp, (tp_rank + 1) * vp)
-        wksd["model.embed_tokens.weight"].copy_(w["model.embed_tokens.weight"][sl].to(device=device, dtype=dtype))
+        wksd["model.embed_tokens.weight"].copy_(
+            w["model.embed_tokens.weight"][sl].to(device=device, dtype=dtype)
+        )
 
     qkv = wksd["self_attn.qkv_proj.weight"]
     if "self_attn.q_proj.weight" in w:
         sl = slice(tp_rank * q_loc, (tp_rank + 1) * q_loc)
-        qkv[:q_loc].copy_(w["self_attn.q_proj.weight"][sl].to(device=device, dtype=dtype))
+        qkv[:q_loc].copy_(
+            w["self_attn.q_proj.weight"][sl].to(device=device, dtype=dtype)
+        )
     if "self_attn.k_proj.weight" in w:
         sl = slice(tp_rank * kv_loc, (tp_rank + 1) * kv_loc)
-        qkv[q_loc : q_loc + kv_loc].copy_(w["self_attn.k_proj.weight"][sl].to(device=device, dtype=dtype))
+        qkv[q_loc : q_loc + kv_loc].copy_(
+            w["self_attn.k_proj.weight"][sl].to(device=device, dtype=dtype)
+        )
     if "self_attn.v_proj.weight" in w:
         sl = slice(tp_rank * kv_loc, (tp_rank + 1) * kv_loc)
-        qkv[q_loc + kv_loc :].copy_(w["self_attn.v_proj.weight"][sl].to(device=device, dtype=dtype))
+        qkv[q_loc + kv_loc :].copy_(
+            w["self_attn.v_proj.weight"][sl].to(device=device, dtype=dtype)
+        )
 
     if "self_attn.o_proj.weight" in w:
         c0, c1 = tp_rank * q_loc, (tp_rank + 1) * q_loc
-        wksd["self_attn.o_proj.weight"].copy_(w["self_attn.o_proj.weight"][:, c0:c1].to(device=device, dtype=dtype))
+        wksd["self_attn.o_proj.weight"].copy_(
+            w["self_attn.o_proj.weight"][:, c0:c1].to(device=device, dtype=dtype)
+        )
 
     part = 2 * iq // tp_size
     glo = tp_rank * part
     if "mlp.gate_proj.weight" in w:
-        _scatter_rows(wksd["mlp.gate_up_proj.weight"], glo, part, w["mlp.gate_proj.weight"], 0, 0, iq, device=device, dtype=dtype)
+        _scatter_rows(
+            wksd["mlp.gate_up_proj.weight"],
+            glo,
+            part,
+            w["mlp.gate_proj.weight"],
+            0,
+            0,
+            iq,
+            device=device,
+            dtype=dtype,
+        )
     if "mlp.up_proj.weight" in w:
-        _scatter_rows(wksd["mlp.gate_up_proj.weight"], glo, part, w["mlp.up_proj.weight"], 0, iq, iq, device=device, dtype=dtype)
+        _scatter_rows(
+            wksd["mlp.gate_up_proj.weight"],
+            glo,
+            part,
+            w["mlp.up_proj.weight"],
+            0,
+            iq,
+            iq,
+            device=device,
+            dtype=dtype,
+        )
 
     if "mlp.down_proj.weight" in w:
         c0, c1 = tp_rank * i0, (tp_rank + 1) * i0
-        wksd["mlp.down_proj.weight"].copy_(w["mlp.down_proj.weight"][:, c0:c1].to(device=device, dtype=dtype))
+        # store TRANSPOSED: HF [h, iq] -> slice [h, i0] -> .t() -> param [i0, h]
+        wksd["mlp.down_proj.weight"].copy_(
+            w["mlp.down_proj.weight"][:, c0:c1].t().to(device=device, dtype=dtype)
+        )
 
     if "input_layernorm.weight" in w:
-        wksd["input_layernorm.weight"].copy_(w["input_layernorm.weight"].to(device=device, dtype=dtype))
+        wksd["input_layernorm.weight"].copy_(
+            w["input_layernorm.weight"].to(device=device, dtype=dtype)
+        )
     if "post_attention_layernorm.weight" in w:
-        wksd["post_attention_layernorm.weight"].copy_(w["post_attention_layernorm.weight"].to(device=device, dtype=dtype))
+        wksd["post_attention_layernorm.weight"].copy_(
+            w["post_attention_layernorm.weight"].to(device=device, dtype=dtype)
+        )
 
 
 def make_rollout_load_weights(
@@ -351,14 +448,8 @@ def make_rollout_load_weights(
     dev = torch.device(device)
 
     def lw(it: Iterable[tuple[str, torch.Tensor]]) -> None:
-        rollout_load_weights(it, wksd, cfg, device=dev, dtype=dtype, tp_rank=tp_rank, tp_size=tp_size)
+        rollout_load_weights(
+            it, wksd, cfg, device=dev, dtype=dtype, tp_rank=tp_rank, tp_size=tp_size
+        )
 
     return lw
-
-
-def trainer_load_spec_path(load_spec_dir: str, rank: int) -> str:
-    return str(Path(load_spec_dir) / f"actor_tp_rank{rank}.json")
-
-
-def rollout_load_spec_path(load_spec_dir: str, rank: int) -> str:
-    return str(Path(load_spec_dir) / f"rollout_rank{rank}.json")

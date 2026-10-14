@@ -169,7 +169,9 @@ The rest of the documentation describes how WeightBridge provides that layer:
   Control Plane.
 - [Integration Guide](integration.md) shows how Trainer Workers and Rollout
   Workers call the adapter APIs.
-- [Limitations](limitations.md) documents current assumptions and caveats.
+- [API Reference](api.md) documents the public classes and helpers.
+- [Examples](examples.md) is a runnable end-to-end walkthrough.
+- [Limitations](limitations.md) documents current assumptions, caveats, and pitfalls.
 
 ## Non-Goals
 

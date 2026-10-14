@@ -1,10 +1,12 @@
-# Imported WeightBridge library provenance
+# Imported WeightBridge snapshot provenance
 
-This change imports only `wbridge/` from `examples/weightbridge/wbridge/` in
+This change imports the complete `examples/weightbridge/` directory from
 https://github.com/meta-pytorch/monarch/pull/4758 at commit
 `d6720b86bc94f2d68c67a31943c1d07580e02da0` (SwiftSeal03/monarch).
-The imported files are byte-for-byte copies of that snapshot. PR examples,
-tests, documentation, and deployment scripts are not imported.
+Library, examples, tests, documentation, scripts, and .gitignore are copied
+verbatim. pyproject.toml additionally declares and packages the source license
+and this notice. LICENSE, MANIFEST.in, and this notice are redistribution
+support files added by this import.
 
 The source repository root LICENSE at that revision is BSD-3-Clause and is
 reproduced verbatim in this repository root LICENSE. Existing Meta Platforms,
@@ -15,17 +17,21 @@ No Meta or Monarch endorsement is claimed.
 
 ## Scope and review requirements
 
-The BSD license here records the terms supplied with the imported library.
-It does not establish ownership of, or newly license, pre-existing Harvard CNS
-examples, tests, or documentation. Their owners must determine their license.
+The BSD license here records the terms supplied with the imported snapshot.
+It does not independently establish copyright ownership. Public source and
+headers do not independently prove employer release authorization. Before
+merging, maintainers should confirm that the relevant rights holders authorized
+this snapshot for public BSD redistribution. This import does not assert that
+confirmation has occurred. The source PR contains a historical CLA warning;
+its current resolution and any applicable internal employer approvals have
+not been verified. Monarch contribution acceptance and downstream
+redistribution are separate questions.
 
-Public source and headers do not independently prove copyright ownership or
-employer release authorization. Before merging, maintainers should confirm
-that the relevant rights holders authorized this snapshot for public BSD
-redistribution. This import does not assert that confirmation has occurred.
-The source PR contains a historical CLA warning; its current resolution and
-any applicable internal employer approvals have not been verified. Monarch
-contribution acceptance and downstream redistribution are separate questions.
+The original Harvard CNS paths absent from the source snapshot are
+`wbridge/frontend/megatron_adapter.py` and
+`wbridge/frontend/sglang_adapter.py`; these obsolete adapters are removed.
+The earlier library-only migration document is removed because documentation,
+examples, and tests now come from the same full source snapshot as the library.
 
 Packaging includes this notice and the BSD license. Optional dependencies
 retain their own licenses; they are not vendored by this import.

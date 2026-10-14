@@ -1,195 +1,79 @@
-"""Reusable Ray actor definitions for WeightBridge Trainer Worker / Rollout Worker pipelines.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
-Configuration is passed as a single :class:`EngineArgs` instance. HF weights are not serialized in
-``EngineArgs``; each worker calls ``build_checkpoint()`` locally so checkpoints are identical across
-nodes without shipping CPU tensors through Ray. Trainer Workers use a TP shard of HF
-names in ``wksd``; Rollout Workers use merged names (``qkv_proj``, ``gate_up_proj``, ...).
-HF shard layout on the wire is defined by :attr:`~wbridge.utils.data.LoadSpec.src_shard_spec` after
-LoadSpec inference inside :class:`~wbridge.frontend.adapters.SenderAdapter` /
-:class:`~wbridge.frontend.adapters.ReceiverAdapter`.
+"""Ray front-end for the WeightBridge example.
+
+All the actual work lives in :mod:`worker_bodies` (orchestrator-agnostic); the actors here are thin
+delegates, and :class:`RayOrchestrator` is the surface :mod:`train` drives. :mod:`workers_monarch`
+provides the same surface on Monarch actors — which is what a Monarch RDMA run requires, since
+``RDMABuffer``/``RDMAAction`` only work inside a Monarch actor.
+
+HF weights are not serialized in ``EngineArgs``; each worker calls ``build_checkpoint()`` locally so
+checkpoints are identical across nodes without shipping CPU tensors through Ray.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import threading
-import time
-from collections.abc import Callable
-from dataclasses import dataclass
 
 import ray
-import torch
-import uvicorn
-from fastapi import FastAPI
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from wbridge.backend import coordinator
+from wbridge.backend.control_channel import coordinator_ipc
 
-from wbridge import WeightReceiverController
-from wbridge.backend.sender import SenderArgs
-from wbridge.frontend.adapters import AdapterContext, ReceiverAdapter, SenderAdapter
-
-from qwen_tiny import (
-    QwenTinyConfig,
-    trainer_load_spec_path,
-    build_trainer_wksd,
-    build_rollout_wksd,
-    make_trainer_load_weights,
-    make_rollout_load_weights,
-    rollout_load_spec_path,
+# Re-exported for callers that import them from here (train.py, bench_transfer.py).
+from worker_bodies import (  # noqa: F401
+    apply_network_env as _apply_network_env_for_process_group,
+    EngineArgs,
+    network_env_vars as _network_env_vars,
+    RolloutWorkerBody,
+    TrainerWorkerBody,
 )
-from utils import make_hf_iter_factory
 
 logger = logging.getLogger("wbridge.example.workers")
-
-CheckpointBuilder = Callable[[], dict[str, torch.Tensor]]
-
-
-def _network_env_vars(provider: str, iface: str) -> dict[str, str]:
-    env_vars = {}
-    if iface:
-        env_vars["NCCL_SOCKET_IFNAME"] = iface
-        env_vars["GLOO_SOCKET_IFNAME"] = iface
-
-    if provider == "tcp":
-        return env_vars
-    if provider != "efa":
-        raise ValueError(f"Unsupported network provider: {provider}")
-
-    ld_paths = ["/opt/amazon/ofi-nccl/lib", "/opt/amazon/efa/lib"]
-    existing_ld = os.environ.get("LD_LIBRARY_PATH")
-    if existing_ld:
-        ld_paths.append(existing_ld)
-    env_vars.update(
-        {
-            "LD_LIBRARY_PATH": ":".join(ld_paths),
-            "FI_PROVIDER": "efa",
-            "FI_EFA_USE_DEVICE_RDMA": "0",
-            "NCCL_DEBUG": "INFO",
-            "NCCL_DEBUG_SUBSYS": "INIT,NET",
-            "NCCL_NET_GDR_LEVEL": "SYS",
-            "NCCL_NET_GDR_READ": "1",
-        }
-    )
-    return env_vars
-
-
-def _apply_network_env_for_process_group(provider: str, iface: str) -> None:
-    for key, value in _network_env_vars(provider, iface).items():
-        if key == "LD_LIBRARY_PATH":
-            os.environ[key] = value
-        else:
-            os.environ.setdefault(key, value)
-
-
-@dataclass
-class EngineArgs:
-    """``build_checkpoint`` must be picklable (e.g. ``functools.partial`` of a module-level function)."""
-
-    rollout_host: str
-    rollout_port: int
-    rollout_scheduling_strategy: NodeAffinitySchedulingStrategy
-    num_rollout_workers: int
-
-    trainer_host: str
-    trainer_pg_port: int
-    trainer_scheduling_strategy: NodeAffinitySchedulingStrategy
-    num_trainer_workers: int
-
-    model_config: QwenTinyConfig
-    build_checkpoint: CheckpointBuilder
-    load_spec_dir: str
-    dtype: torch.dtype = torch.float32
-    # ``gpu_direct`` (NCCL) or ``cpu_direct`` (Gloo, CPU wire buffers, overlapped send/recv).
-    transfer_mode: str = "gpu_direct"
-
-    rollout_controller_ipc_name: str = ""
-    network_provider: str = "tcp"
-    network_interface: str = "eno1"
 
 
 @ray.remote(num_gpus=1, num_cpus=1)
 class RolloutWorker:
-    """One per Rollout Worker GPU. Receives weights and verifies against a pre-update backup."""
+    def __init__(self) -> None:
+        self._b = RolloutWorkerBody()
 
     def init(self, rank: int, args: EngineArgs):
-        _apply_network_env_for_process_group(args.network_provider, args.network_interface)
-        self.rank = rank
-        self.args = args
-        cfg = args.model_config
-        hf_cpu = args.build_checkpoint()
-        hf_iter_factory = make_hf_iter_factory(hf_cpu)
-        self.state_dict = build_rollout_wksd(
-            cfg,
-            device="cuda",
-            dtype=args.dtype,
-            tp_rank=rank,
-            tp_size=args.num_rollout_workers,
-        )
-        load_weights = make_rollout_load_weights(
-            self.state_dict,
-            cfg,
-            device="cuda",
-            dtype=args.dtype,
-            tp_rank=rank,
-            tp_size=args.num_rollout_workers,
-        )
-        load_weights(hf_iter_factory())
-        ctx = AdapterContext(
-            hf_iter_factory=hf_iter_factory,
-            wksd=self.state_dict,
-            load_weights=load_weights,
-            load_spec_path=rollout_load_spec_path(args.load_spec_dir, rank),
-            rank=rank,
-        )
-        self.adapter = ReceiverAdapter(ctx, args.rollout_controller_ipc_name)
-        # Snapshot the loaded weights before the first recv so verify() can diff backup vs received.
-        self.state_dict_backup = {name: t.detach().clone() for name, t in self.state_dict.items()}
+        return self._b.init(rank, args)
 
     def recv_weights(self) -> None:
-        for _ in range(500):
-            t0 = time.time()
-            updated = self.adapter.is_update_ready() and self.adapter.request_update()
-            t1 = time.time()
-            if updated:
-                print(f"RolloutWorker rank {self.rank} recv_weights start wall_s={t0} return wall_s={t1}")
-                return
-            time.sleep(0.05)
-        raise TimeoutError("receiver never became ready for weights")
+        return self._b.recv_weights()
+
+    def transport_stats(self) -> dict:
+        return self._b.transport_stats()
 
     def verify(self) -> dict:
-        for name, backup in self.state_dict_backup.items():
-            received = self.state_dict[name]
-            if not torch.allclose(backup, received):
-                return {
-                    "rank": self.rank,
-                    "name": name,
-                    "ok": False,
-                    "detail": (
-                        f"value mismatch for {name} on rank {self.rank}, "
-                        f"expected: {backup[:, :1].view(-1)}, got: {received[:, :1].view(-1)}"
-                    ),
-                }
-        return {"rank": self.rank, "ok": True, "detail": "all values match"}
+        return self._b.verify()
 
 
 @ray.remote(num_cpus=1)
 class RolloutEngine:
-    """Hosts the Rollout Engine HTTP server and spawns :class:`RolloutWorker` actors."""
+    """Spawns the standalone ZMQ coordinator process and the :class:`RolloutWorker` actors.
+
+    There is no HTTP server: the control plane is a per-engine coordinator subprocess (pure ZMQ).
+    """
 
     def init(self, args: EngineArgs):
-        app = FastAPI()
-        self.controller = WeightReceiverController(app)
-        args.rollout_controller_ipc_name = self.controller.ipc_name
-
-        config = uvicorn.Config(app, host=args.rollout_host, port=args.rollout_port)
-        server = uvicorn.Server(config)
-        threading.Thread(target=server.run, daemon=True).start()
-        while not server.started:
-            time.sleep(0.1)
-        print(f"RolloutEngine started on {args.rollout_host}:{args.rollout_port}")
+        # Standalone coordinator process: Trainer-facing tcp://*:rollout_port, rank0-facing IPC. The IPC
+        # path is derived deterministically from the port so the (co-located) workers agree on it.
+        ipc = coordinator_ipc(args.rollout_port)
+        args.rollout_controller_ipc_name = ipc
+        self._coord_proc = coordinator.spawn(ipc, args.rollout_port)
+        print(
+            f"RolloutEngine coordinator on {args.rollout_host}:{args.rollout_port} (ipc {ipc})"
+        )
 
         n = args.num_rollout_workers
-        runtime_env = {"env_vars": _network_env_vars(args.network_provider, args.network_interface)}
+        runtime_env = {
+            "env_vars": _network_env_vars(args.network_provider, args.network_interface)
+        }
         self._workers = [
             RolloutWorker.options(
                 scheduling_strategy=args.rollout_scheduling_strategy,
@@ -197,12 +81,14 @@ class RolloutEngine:
             ).remote()
             for _ in range(n)
         ]
+        # rank 0 reports num_workers to the coordinator on connect — no set_worker_num needed.
         ray.get([w.init.remote(rank, args) for rank, w in enumerate(self._workers)])
-
-        self.controller.set_worker_num(n)
 
     def recv_weights(self) -> None:
         ray.get([w.recv_weights.remote() for w in self._workers])
+
+    def transport_stats_all(self) -> list[dict]:
+        return ray.get([w.transport_stats.remote() for w in self._workers])
 
     def verify_all(self) -> str:
         results = ray.get([w.verify.remote() for w in self._workers])
@@ -215,54 +101,17 @@ class RolloutEngine:
 
 @ray.remote(num_gpus=1, num_cpus=1)
 class TrainerWorker:
-    """One per Trainer Worker GPU. Sends shards via :class:`~wbridge.frontend.adapters.SenderAdapter`."""
+    def __init__(self) -> None:
+        self._b = TrainerWorkerBody()
 
     def init(self, rank: int, args: EngineArgs):
-        _apply_network_env_for_process_group(args.network_provider, args.network_interface)
-        self.args = args
-        self.rank = rank
-        cfg = args.model_config
-        hf_cpu = args.build_checkpoint()
-        hf_iter_factory = make_hf_iter_factory(hf_cpu)
-        self.state_dict = build_trainer_wksd(
-            cfg,
-            device="cuda",
-            dtype=args.dtype,
-            tp_rank=rank,
-            tp_size=args.num_trainer_workers,
-        )
-        load_weights = make_trainer_load_weights(
-            self.state_dict,
-            cfg,
-            device="cuda",
-            dtype=args.dtype,
-            tp_rank=rank,
-            tp_size=args.num_trainer_workers,
-        )
-        load_weights(hf_iter_factory())
-        ctx = AdapterContext(
-            hf_iter_factory=hf_iter_factory,
-            wksd=self.state_dict,
-            load_weights=load_weights,
-            load_spec_path=trainer_load_spec_path(args.load_spec_dir, rank),
-            rank=rank,
-        )
-        sender_args = SenderArgs(
-            world_size=args.num_trainer_workers,
-            transfer_mode=args.transfer_mode,
-            receiver_urls=[f"http://{args.rollout_host}:{args.rollout_port}"],
-            master_addr=args.trainer_host,
-            master_port=args.trainer_pg_port,
-        )
-        self.adapter = SenderAdapter(ctx, sender_args)
+        return self._b.init(rank, args)
 
     def send_weights(self):
-        self.adapter.connect()
-        t0 = time.time()
-        print(f"TrainerWorker rank {self.rank} send_weights start wall_s={t0}")
-        self.adapter.send_weights()
-        t1 = time.time()
-        print(f"TrainerWorker rank {self.rank} send_weights return wall_s={t1} elapsed_s={t1 - t0}")
+        return self._b.send_weights()
+
+    def transport_stats(self) -> dict:
+        return self._b.transport_stats()
 
 
 class TrainerEngine:
@@ -270,7 +119,9 @@ class TrainerEngine:
 
     def __init__(self, args: EngineArgs):
         n = args.num_trainer_workers
-        runtime_env = {"env_vars": _network_env_vars(args.network_provider, args.network_interface)}
+        runtime_env = {
+            "env_vars": _network_env_vars(args.network_provider, args.network_interface)
+        }
         self._workers = [
             TrainerWorker.options(
                 scheduling_strategy=args.trainer_scheduling_strategy,
@@ -283,3 +134,39 @@ class TrainerEngine:
 
     def send_weights(self):
         ray.get([w.send_weights.remote() for w in self._workers])
+
+    def transport_stats_all(self) -> list[dict]:
+        return ray.get([w.transport_stats.remote() for w in self._workers])
+
+
+class RayOrchestrator:
+    """Ray implementation of the surface :mod:`train` drives."""
+
+    name = "ray"
+
+    def __init__(self, args: EngineArgs) -> None:
+        self.args = args
+
+    def start(self) -> None:
+        # Trainer first: LoadSpec inference writes to disk and the rollout side reads it.
+        self._trainer = TrainerEngine(self.args)
+        self._rollout = RolloutEngine.options(
+            scheduling_strategy=self.args.rollout_scheduling_strategy
+        ).remote()
+        ray.get(self._rollout.init.remote(self.args))
+
+    def run_transfer(self) -> None:
+        recv = self._rollout.recv_weights.remote()  # poll concurrently with the send
+        self._trainer.send_weights()
+        ray.get(recv)
+
+    def verify_all(self) -> str:
+        return ray.get(self._rollout.verify_all.remote())
+
+    def transport_stats(self) -> list[dict]:
+        return self._trainer.transport_stats_all() + ray.get(
+            self._rollout.transport_stats_all.remote()
+        )
+
+    def shutdown(self) -> None:
+        ray.shutdown()
