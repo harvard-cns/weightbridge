@@ -8,7 +8,7 @@
 
 Replaces the former FastAPI ``WeightReceiverController``. Runs as its OWN process (spawned once per
 rollout engine) so external control requests from the Trainer are serviced continuously, independent of
-any rollout worker's scheduler tick. Pure ``zmq`` + JSON — no torch, no FastAPI.
+any rollout worker's inference step. Pure ``zmq`` + JSON — no torch, no FastAPI.
 
 **Thin relay.** It forwards the Trainer's one-time ``connect`` (and rare zero-input ``receive`` fallback)
 to receiver rank 0 over the node-local IPC ROUTER and routes rank 0's ack back over the Trainer-facing TCP

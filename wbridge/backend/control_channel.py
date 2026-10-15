@@ -10,10 +10,10 @@ Two pieces, split by which thread owns their ZMQ sockets (sockets are NOT thread
 
 * :class:`CoordinatorClient` — rank0's trainer-facing intake (the ``worker-0`` DEALER to the coordinator).
   Owned by rank0's **receiving thread**; normally it carries connect only, plus the zero-input update
-  fallback, independently of the scheduler tick.
+  fallback, independently of the inference step.
 * :class:`ControlChannel` — the rank0<->peers **hub star**, used on the **main (scheduler) thread**. Every
-  scheduler tick uses a prepare/ack/commit barrier, so all of an engine's TP ranks have reached the hook
-  before any rank proceeds. This includes ``empty`` ticks: the barrier bounds the queue to one decision and
+  inference step uses a prepare/ack/commit barrier, so all of an engine's TP ranks have reached the hook
+  before any rank proceeds. This includes ``empty`` inference steps: the barrier bounds the queue to one decision and
   avoids making peer ranks sleep until a long polling timeout.
 
 rank0's main thread reads the state the receiving thread posted and feeds it into
@@ -63,7 +63,7 @@ WBRIDGE_PORT_OFFSET = 1717
 WBRIDGE_HUB_PORT_OFFSET = WBRIDGE_PORT_OFFSET + 1
 
 # This startup guard covers both registration hops: receiver rank 0 joining
-# the standalone coordinator and the remaining model-parallel ranks joining
+# the standalone coordinator and the remaining ranks joining
 # rank 0's hub.  Large-model LoadSpec construction can stagger those ranks by
 # many minutes, so launchers need one consistent knob for both waits.
 STARTUP_REGISTER_TIMEOUT_ENV = "WBRIDGE_COORDINATOR_REGISTER_TIMEOUT_S"
@@ -259,7 +259,7 @@ class ControlChannel:
         return {k: v for k, v in decision.items() if k not in (_SYNC_SEQ, _SYNC_PHASE)}
 
     def broadcast(self, decision: dict[str, Any]) -> None:
-        """Rank 0: barrier-broadcast one scheduler-tick decision.
+        """Rank 0: barrier-broadcast one decision for an inference step.
 
         Peers acknowledge the prepare from the scheduler thread and wait for a commit. Rank 0 returns only
         after all peers are quiescent and the commit has been published. ``EMPTY`` follows the same bounded
@@ -327,7 +327,7 @@ class ControlChannel:
             self._hub.send_multipart([ident, payload])
 
     def poll_decision(self, timeout_ms: int = 5000) -> Optional[dict[str, Any]]:
-        """Peer scheduler thread: wait for rank 0's next scheduler-tick decision.
+        """Peer scheduler thread: wait for rank 0's next decision for an inference step.
 
         The initial prepare wait is bounded by *timeout_ms* so idle schedulers continue normally.  Once a
         prepare arrives, this rank acknowledges that it is quiescent and waits for the matching commit; no

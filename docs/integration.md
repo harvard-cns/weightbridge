@@ -6,6 +6,10 @@ inference/generation runtime (the *rollout engine*, which must periodically refr
 WeightBridge does not parse your model or own your scheduler — you describe your runtime through a
 small **adapter context**, and drive two calls from your loops.
 
+This document combines the integration workflow and public API reference. For package setup,
+see the [Installation Guide](installation.md); for class signatures and methods, see the
+[API reference](#api-reference) below.
+
 If you learn best from code, read this alongside [`examples/`](examples.md), a complete, runnable
 2-node Ray demo that implements everything below on a toy model.
 
@@ -20,7 +24,7 @@ experiment artifact rather than in the reusable library tree.
 | Piece | How many | What it is |
 |---|---|---|
 | **Coordinator** | one per rollout engine | a standalone ZMQ relay **process** you spawn; not part of any worker |
-| **Receiver** (`ReceiverAdapter`) | one per rollout **model-parallel rank** | lives inside each rollout worker process; receives + loads weights |
+| **Receiver** (`ReceiverAdapter`) | one per rollout **rank** | lives inside each rollout worker process; receives + loads weights |
 | **Sender** (`SenderAdapter`) | one per trainer **shard-owning rank** | lives inside each trainer worker process; packs + sends weights |
 
 You keep these long-lived: build once, reuse for every update. Never construct them per update, and
@@ -32,6 +36,14 @@ never lazily from a request handler.
 
 WeightBridge never introspects your model. On **both** sides you supply an `AdapterContext` — five
 things — and it infers everything else (the layout mapping, the routing, the RDMA plan) from them:
+
+| field | type | meaning |
+|---|---|---|
+| `hf_weights` | `dict[str, Callable[[], Tensor]]` | HF tensor name → zero-arg factory. Called many times; must be re-callable and side-effect-free. |
+| `hf_shapes` | `dict[str, tuple[int, ...]]` | HF tensor name → shape. |
+| `wksd_factory` | `Callable[[], dict[str, Tensor]]` | returns a **fresh** GPU worker-state-dict snapshot each call. |
+| `load_weights` | `Callable[[HFWeightFetcher], Any]` | your native loader, adapted to take the fetcher dict; pure bijective copy/scatter for same-dtype elements. |
+| `rank` | `int` | this adapter's rank. |
 
 ```python
 from wbridge.frontend.adapters import AdapterContext
@@ -68,8 +80,8 @@ Requirements — each is load-bearing:
    - it accepts the **complete** name→factory dict each call (some loaders do cross-rank comms, e.g.
      broadcasting tied embeddings, and break on a partial dict).
    Most mainstream dense/MoE loaders already satisfy this in bf16; see
-   [limitations](limitations.md#loadspec-inference) for the assumptions and known exceptions.
-5. **`rank`** — this adapter's rank (see [rank rules](#rank--worker-count-rules)).
+   [limitations](limitations.md#loadspec-extraction) for the assumptions and known exceptions.
+5. **`rank`** — this adapter's worker-process rank.
 
 Constructing a `SenderAdapter`/`ReceiverAdapter` with the context runs the whole metadata plane
 (`infer_load_spec` → `verify_load_spec`) at construction. `verify_load_spec` reconstructs your worker
@@ -91,18 +103,6 @@ context fails loudly at build time, not silently at transfer time.
 
 ---
 
-## Rank & worker-count rules
-
-- **Trainer:** every rank that owns a shard of the model is a sender; `SenderArgs.world_size` is the
-  number of such ranks. `rank` is that rank.
-- **Rollout:** one receiver per **model-parallel** process. `rank` and `num_workers` must count the
-  full model-parallel grid: **`num_workers = TP × PP`**, and `rank = TP_size × PP_rank + TP_rank`
-  (the global model-parallel rank). Do **not** multiply by data-parallel size (DP replicas share the
-  TP processes) or expert-parallel size (experts reshard within TP ranks). Keying on bare `TP_rank`
-  with PP > 1 collides ranks and spawns a coordinator per stage.
-
----
-
 ## Step-by-step
 
 ### Rollout side (receiver)
@@ -119,12 +119,13 @@ context fails loudly at build time, not silently at transfer time.
    coord_proc = coordinator.spawn(ipc, coordinator_tcp_port(port))  # detached subprocess
    ```
 3. **In every model-parallel worker process**, after weights are loaded but **before** other large
-   allocations (so specgen + RDMA registration have free HBM), build the context and the receiver:
+   allocations (so specgen + RDMA registration have free HBM), build the context and the receiver.
+   `num_workers` is the number of worker processes in this inference engine:
    ```python
    from wbridge.frontend.adapters import ReceiverAdapter
-   adapter = ReceiverAdapter(ctx, ipc, num_workers=TP*PP)   # rank came from ctx
+   adapter = ReceiverAdapter(ctx, ipc, num_workers=num_workers)   # rank came from ctx
    ```
-4. **Drive the receiver from your scheduler/generation loop, on every tick, on all ranks in
+4. **Drive the receiver from your scheduler/generation loop, on every inference step, on all ranks in
    lockstep:**
    ```python
    pending_epoch = [None]
@@ -180,7 +181,7 @@ context fails loudly at build time, not silently at transfer time.
    record_trainer_block_end()
    adapter.flush_profile_outputs()
    ```
-   That's it — no collective with the rollout engine, no pause.
+   The rollout engine continues servicing `poll_requests()` during delivery.
 10. **Rollout:** nothing extra — the sender's first data-ready flag wakes rank 0, and the poll from step 4
     applies the update. There is no normal per-update trainer→coordinator doorbell.
 
@@ -192,7 +193,7 @@ API calls above:
 - Emit `send_start(epoch)` on every participating trainer rank immediately before its
   `send_weights()` call, after any pre-send barrier. Do not place it at the outer update entry or before
   unrelated pause/preparation work.
-- Emit `consume_end(epoch)` on every rollout model-parallel rank immediately after
+- Emit `consume_end(epoch)` on every rollout rank immediately after
   `poll_requests()` returns `True`, before generation resumes, scheduler bookkeeping runs, or profiling
   output is flushed.
 - Compute `EWTT(epoch) = max(consume_end wall time) - min(send_start wall time)` across all trainer
@@ -212,22 +213,26 @@ does not confuse the sender's pack-handoff event with completion, which is impor
 These follow directly from the [threading model](architecture.md#threading-model). Violating them
 deadlocks or silently corrupts weights.
 
-- **Enter in lockstep.** Call `poll_requests()` on **all** model-parallel ranks
-  every tick, driven by rank 0's broadcast. Never self-schedule per rank, never skip ranks.
+- **Enter in lockstep.** Call `poll_requests()` on **all** ranks
+  every inference step, driven by rank 0's broadcast. Never self-schedule per rank, never skip ranks.
 - **Treat GO as quiescence.** Rank 0 emits GO on its own first GPU-ingress readiness. Every peer stops
   scheduler/TP work on that decision, then waits for its own readiness before assemble/repack; it must not
   continue inference independently after rank 0 leaves the TP path. Each external-slot internal-consume kernel
   then depends only on that exact slot's READY. A per-slot cyclic aggregate CONS protects its next external
   generation after every local reader kernel finishes; unrelated slots and ranks impose no exchange barrier.
-- **Never pause the rollout engine around the transfer.** A blanket "pause generation" bracket inside
-  the update path deadlocks the flag handshake (a paused receiver won't complete its lockstep role).
-  Enforce on-policy freshness at the **orchestration layer** — drain in-flight rollouts *before*
-  triggering the update — not by pausing the engine.
-- **Keep the rollout loop running during `connect()`.** Connect is a rendezvous between trainer rank 0
-  and receiver rank 0; if the rollout side isn't polling, connect blocks.
+- **Be cautious when pausing the rollout engine.** Make sure `poll_requests()` remains reachable
+  on all ranks while the engine is paused, so connection setup and weight updates can progress.
+  A pause that prevents polling can block the transfer handshake.
 - **`send_weights()` returns after packing, not after delivery.** Call `ev.synchronize()` before you
   overwrite the packed weights. Delivery overlaps your next step; only debug flows need
   `wait_send_complete()`.
+
+- **Clean up and process stale requests in your runtime.** Use the `before_receive(epoch)` hook
+  passed to `poll_requests(before_receive=...)` to quiesce outstanding inference work and cancel,
+  drain, or mark requests affected by the pending weight update. After `poll_requests()` returns
+  `True`, perform any remaining cleanup and process stale requests according to your RL policy
+  before resuming generation. The hook must preserve rank lockstep; WeightBridge does not manage
+  request lifecycle or define which stale results your application should accept.
 
 ## Reconnect & teardown
 
@@ -253,9 +258,113 @@ The same calls serve both modes; only *where you place them* differs:
 - **Don't** create an HTTP server or route weight readiness through your engine's internal messaging —
   the coordinator is a process and the receiver polls.
 - **Don't** construct adapters/coordinator lazily from request handlers — build them at init.
-- **Don't** wrap the transfer in a generation pause (see above).
+- **If you pause generation**, keep `poll_requests()` reachable on all ranks (see above).
 - **Don't** hand-write shard math — provide a correct `load_weights` and let specgen infer it.
 
 For the pitfalls that cause silent failures (transport zero-transfer, dedup correctness, transpose/dtype),
-read [limitations.md](limitations.md) before your first real run. For per-class API details, see
-[api.md](api.md).
+read [limitations.md](limitations.md) before your first real run.
+
+## API reference
+
+Import the frontend adapters for normal integration. Framework-specific packages and optional
+transports are supplied by your runtime; see [installation](installation.md). Lower-level source
+modules implement the transport internals.
+
+### `SenderArgs`
+
+Transport configuration for the sender.
+
+| field | type | meaning |
+|---|---|---|
+| `world_size` | `int` | number of trainer sender ranks in the connect group. |
+| `receiver_urls` | `list[str]` | `tcp://host:port` of each rollout engine's coordinator (one per engine). |
+| `master_addr` | `str` | trainer rank-0 host for the one-time Gloo metadata rendezvous. |
+| `master_port` | `int` | TCP port for that Gloo group. |
+| `protocol` | `str = "efa"` | RDMA backend: `"efa"` (Mooncake on an EFA cluster), `"tcp"` (Mooncake, local/toy runs), or `"monarch"` (libibverbs via Monarch; requires Monarch-actor workers and rules out staging). See [transport backends](architecture.md#transport-backends). |
+| `sender_staging` | `bool = False` | pack → CPU offload → RDMA-from-CPU pipeline; off = straight-from-GPU (validated default). |
+
+### `SenderAdapter`
+
+Trainer-side integration. Construction runs `LoadSpec` inference + verification and builds a
+`WeightSender`.
+
+- `connect() -> None` — queries each coordinator, joins the Gloo rendezvous, registers RDMA buffers,
+  starts the background RDMA thread. Call **once**; reuse for all updates.
+- `send_weights() -> torch.cuda.Event | None` — packs on the calling thread, hands RDMA to the
+  background thread, returns an event that fires when the packed weights are safe to overwrite. One
+  call = one update.
+- `wait_send_complete() -> None` — blocks until the last update is delivered and consumed by all
+  receivers. Only needed for debug/equality checks; production skips it so RDMA overlaps the next step.
+- `flush_profile_outputs() -> None` — release Gantt/control profiling output for the latest epoch. Call
+  only after recording the application's trainer `block_end`; it does not wait for background delivery.
+
+### `ReceiverAdapter`
+
+Rollout-side integration. Construction runs `LoadSpec` inference + verification and builds a
+`WeightReceiver` (eagerly, so it can handshake before transfer).
+
+- `poll_requests(before_receive: Callable[[int], None] | None = None) -> bool` — performs one control
+  round and services its action on the main thread, called every inference step on all ranks. Rank 0
+  peeks its first-round CPU flag and broadcasts KICK/GO. For a real update, `before_receive(epoch)` runs
+  synchronously on every rank after GO but before model weights are mutated, allowing the
+  runtime to quiesce inference and cancel admitted requests. The callback must preserve rank lockstep and
+  must not start asymmetric TP/EP work. Empty polls, staging KICKs, and deferred connection setup return
+  `False`; a completed receive+load returns `True`.
+- **EWTT timing hook:** record a trainer `send_start` immediately before `send_weights()` and a rollout
+  `consume_end` immediately after `poll_requests()` returns `True`. Across a distributed deployment,
+  EWTT is the earliest trainer `send_start` to the latest rollout-rank `consume_end`. Use a cross-host
+  wall clock for those endpoints; a process-local monotonic clock cannot be subtracted across nodes.
+- `flush_profile_outputs() -> None` — release Gantt JSONL, control-profile logs, and a requested receiver
+  chrome trace for the latest epoch. Call after recording rollout `block_end`.
+- `num_workers` is the number of worker processes in the inference engine; `receiver_staging` enables the
+  full-epoch CPU landing pipeline. KICK leaves generation running; GO follows rank 0's completed first-round
+  H2D, and every peer then waits for its own corresponding host-side flag.
+
+### Coordinator (control plane)
+
+A standalone ZMQ relay **process**, one per rollout engine. It is not HTTP and holds no torch.
+
+- `coordinator.spawn(ipc_name, tcp_port) -> subprocess.Popen` — launches the coordinator; it self-exits
+  when the spawning process dies.
+- `coordinator_ipc(port)`, `coordinator_tcp_port(port)`, `hub_addr(port)` — derive the IPC path, the
+  trainer-facing TCP port, and the rank0↔peers hub endpoint deterministically from one per-engine
+  integer, so no address handoff is needed. The trainer connects to `tcp://{host}:{coordinator_tcp_port(port)}`.
+- `WeightReceiverController` — the class the coordinator process runs (`__init__(ipc_name, tcp_endpoint)`,
+  `serve()`, `close()`). You normally use `coordinator.spawn`, not this directly. There is **no**
+  `set_worker_num` and **no** HTTP route — rank 0 auto-registers the receiver count.
+
+### Backend endpoints
+
+`SenderAdapter`/`ReceiverAdapter` own these; use them directly only for a bespoke integration.
+
+- `WeightSender(args, rank, shard_spec, load_spec, wksd)` — `connect()`, `send()`, `wait_send_complete()`.
+- `WeightReceiver(controller_ipc_name, rank, shard_spec, dtype_spec, load_spec, wksd, *, num_workers, receiver_staging=False)`
+  — `poll_requests()`, `stop()`.
+
+### Metadata helpers
+
+From `wbridge.utils.specgen`:
+
+- `hf_weights_from_checkpoint(hf_path) -> (HFWeightFetcher, dict[str, shape])` — builds `hf_weights` +
+  `hf_shapes` from a safetensors (or single-`.bin`) checkpoint via a metadata-only scan.
+- `infer_load_spec(hf_weights, hf_shapes, wksd_factory, load_weights) -> LoadSpec` — probe-based layout
+  inference (run for you by the adapters).
+- `verify_load_spec(hf_weights, wksd_factory, load_spec) -> None` — reconstructs and asserts
+  byte-equality (also run by the adapters).
+- Type aliases: `HFWeightFetcher = dict[str, Callable[[], Tensor]]`, `LoadWeightsFn`, `WksdFactory`.
+
+`ShardSpec`, `BoundShardSpec`, `LoadSpec`, `CopyPlan` (in `wbridge.utils.data`) are the internal
+data-plane types; the adapters produce and consume them — integrators rarely touch them directly.
+
+### Reference adapters
+
+These are **concrete examples** of the adapter pattern, not part of the framework-agnostic API. Read
+them as copy-me templates when writing an adapter for your own runtime; import them directly so
+environments without those dependencies don't import them.
+
+WeightBridge does not declare any inference or training framework as a package dependency. A framework
+adapter subclasses `SenderAdapter` or `ReceiverAdapter` and supplies `hf_weights`, `wksd_factory`, and
+`load_weights` for that runtime.
+
+Each shows the same pattern: wrap an existing `load_weights`, expose HF factories + a state-dict
+snapshot, then defer to `SenderAdapter`/`ReceiverAdapter`.

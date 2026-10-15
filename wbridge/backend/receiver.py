@@ -131,8 +131,8 @@ class WeightReceiver(WBEndpoint):
         # scheduler-thread call executes it.
         self._pending: Optional[dict[str, Any]] = None
 
-        # Hub star (MAIN thread, all ranks): rank0 broadcasts one decision per tick, peers block for it. This
-        # per-tick rendezvous keeps the engine's TP ranks in lockstep, so a blocking collective (the connect
+        # Hub star (MAIN thread, all ranks): rank0 broadcasts one decision per inference step, peers block for it. This
+        # rendezvous at each inference step keeps the engine's TP ranks in lockstep, so a blocking collective (the connect
         # rendezvous, the receiver<->receiver all-gather) is entered by all ranks together — never with one
         # rank stuck in an unrelated collective (which is what deadlocked when this was decoupled). Created +
         # used only on the main thread.
@@ -194,7 +194,7 @@ class WeightReceiver(WBEndpoint):
         )
         self._rs_receiving = (
             -1
-        )  # epoch currently in flight (avoids re-signaling every tick)
+        )  # epoch currently in flight (avoids re-signaling every inference step)
         self._rs_staged = -1  # epoch the worker has fully landed in CPU
         self._rs_gpu_ready = (
             -1
@@ -502,7 +502,7 @@ class WeightReceiver(WBEndpoint):
                 error = exc
             result_q.put((ri, peer, error))
 
-    # ----- rank0 coordinator intake (own thread; decoupled from the scheduler tick) -----
+    # ----- rank0 coordinator intake (own thread; decoupled from the inference step) -----
     def _coordinator_worker(self) -> None:
         """rank0: own the coordinator DEALER and post connect/fallback requests for the main thread.
 
@@ -690,7 +690,7 @@ class WeightReceiver(WBEndpoint):
                 self._ext_cv.notify_all()  # release the coordinator thread for the next request
             decision = self._rank0_decision(req, staged=rs)
             if decision.get("type") == RECEIVE_REQUEST and gantt.ON:
-                # Peers consume the hub's FIFO decision stream one item per scheduler tick. Timestamp GO at
+                # Peers consume the hub's FIFO decision stream one item per inference step. Timestamp GO at
                 # its source so a queued-EMPTY backlog appears explicitly as decision_lag in the Gantt.
                 decision["_gantt_broadcast_t0"] = time.time()
             self._chan.broadcast(decision)
@@ -702,7 +702,7 @@ class WeightReceiver(WBEndpoint):
             decision = self._chan.poll_decision(500 if rs else 5000)
             if decision is None:
                 self._pending = None
-                return False  # slow rank0; retry next tick (not a hang)
+                return False  # slow rank0; retry next inference step (not a hang)
         kind = decision.get("type")
         if kind == CONNECT_REQUEST:
             self._pending = decision
@@ -742,7 +742,7 @@ class WeightReceiver(WBEndpoint):
     def _rank0_decision(
         self, req: Optional[dict[str, Any]], *, staged: bool
     ) -> dict[str, Any]:
-        """Build rank 0's data-driven KICK/GO decision for one scheduler tick."""
+        """Build rank 0's data-driven KICK/GO decision for one inference step."""
         if req is not None and req.get("type") == CONNECT_REQUEST:
             return req
         if not self._connected:
@@ -790,7 +790,7 @@ class WeightReceiver(WBEndpoint):
 
         Returns ``True`` only after a weight update has been received and loaded.  Connection setup and
         polls without a completed update return ``False``.  Like the former two-call adapter sequence,
-        this method must be driven on every model-parallel rank on every scheduler tick.
+        this method must be driven on every rank on every inference step.
         """
         if not self.is_update_ready():
             return False

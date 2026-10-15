@@ -1,56 +1,102 @@
 # Assumptions, Limitations & Pitfalls
 
-Read this before your first real run. Several failure modes here are **silent** — the job exits 0 while
-no weights actually moved — so the section ends with how to validate.
+This document separates assumptions required by the current implementation, implementation
+limitations, and deployment pitfalls. Consequences of violating an assumption are labeled:
 
-Treat the values in this document as library defaults or observed operating points, not as a portable
-benchmark profile. Freeze and validate the complete environment in the experiment artifact for each
-deployment.
+- **Failure:** an assertion, exception, hang, or incorrect result, including silent corruption.
+- **Degraded performance:** execution may remain correct but communication or computation slows down.
+- **Untested:** outside the assumed configuration; correctness and performance are not established.
+  This label is not a guarantee that the configuration works or fails.
 
----
+Treat defaults and observed operating points as deployment-specific. Record model, topology,
+container, transport versions, and environment settings with each experiment.
 
-## `LoadSpec` inference
+## Assumptions
 
-WeightBridge learns your layout by probing your `load_weights` (see
-[architecture](architecture.md#metadata-plane-gloo-once)). That probe is valid only when:
+### `LoadSpec` Extraction
 
-1. **`load_weights` is a pure, bijective copy/scatter for same-dtype elements.** Each destination
-   element is an exact bitwise copy of exactly one source element. Only layout operations are allowed
-   (`copy_`, `narrow`, `select`, `view`, `reshape`, `permute`, `transpose`, `split`, `chunk`, `cat`,
-   `index_select`, `scatter_`, `contiguous`). **Any arithmetic on values** — scaling, addition,
-   clamping, quantization, normalization — corrupts the probe. Post-load hooks that requantize are
-   fine *as long as* they run **after** `load_weights` returns (they usually do).
-2. **Same dtype on both sides** for each `(hf_name, worker_name)` pair. The probe encodes indices using
-   the worker tensor's element size; a differing HF element size corrupts them. Trust an inferred spec
-   only for same-dtype source/dest pairs.
-3. **The full name→factory dict is passed each call** (some loaders do cross-rank comms, e.g.
-   broadcasting tied embeddings under PP > 1).
-4. **Shard mappings are rectangular**, between tensors of equal dimensionality; each contiguous
-   component is a rectangular box; >2D tensors map as a single component.
+WeightBridge probes weight loaders of your backend frameworks to infer a `LoadSpec`. See the
+[metadata plane](architecture.md#metadata-plane-gloo-once) and
+[specgen implementation](../wbridge/utils/specgen.py).
+
+1. **The loader preserves same-dtype probe values.** Each destination element is copied from exactly
+   one source element and the value won't change if their precisions align. Arithmetic, normalization,
+   and quantization inside the probed loader alter encoded indices. Post-load transformations must remain
+   outside that probed operation.
+
+   - **Consequence of violation — Failure:** inference can produce invalid mappings or fail; incorrect mappings can
+     corrupt transferred weights. Verification is a useful check, not proof that every loader is valid.
+2. **Checkpoint tensors must be at most 2D.** `LoadSpec` extraction supports 1D and 2D
+   checkpoint tensors; higher-dimensional checkpoint sources are not generally supported.
+
+   - **Consequence of violation — Failure:** extraction or restoration can produce incompatible
+     source/destination shapes and fail, even for an identity loader.
+3. **The LoadSpec can be represented by a modest number of at-most-2D slice-copy operations.**
+   Worker tensors with ≥3 dimensions are flattened to their last two dimensions: leading dimensions
+   are collapsed into the second-to-last dimension, while the last dimension remains unchanged.
+   The mapping is represented as copies between checkpoint slices and slices of that flattened view.
+   Multiple components are supported, provided the
+   resulting slice-copy representation does not become excessively fragmented.
+
+   - **Consequence of violation — Degraded performance / Failure (OOM):** many small slices increase
+     sparse probe entries, extraction work, and copy-plan metadata. Highly fragmented mappings can
+     make inference and copying slow or exhaust CPU/GPU memory.
 
 **Verified** for mainstream dense and MoE models (Llama, Qwen, Mistral, DeepSeek, GLM) in bf16.
 **Known exceptions** (arithmetic inside `load_weights`, so incompatible unless bypassed): Gemma-1
 (`+= 1.0` on norms), AMD-HIP INT4 MoE scaling, DeepSeek NvFP4 requant, `flash_rl` per-token-group FP8
-quant, BitsAndBytes 4-bit. `verify_load_spec` (run at adapter construction) will fail loudly if your
-loader violates these — trust that assertion.
+quant, BitsAndBytes 4-bit. `verify_load_spec` runs at adapter construction and detects reconstruction
+mismatches, but does not establish support for arbitrary loader transformations.
 
----
+### Transport
+
+These assumptions concern execution of the inferred LoadSpec, rather than extraction of the mapping.
+
+1. **No multi-destination mappings for the same parameter element within a worker's LoadSpec.**
+   Each source element, identified by its HF tensor name and element coordinates, maps to at most
+   one destination element in that worker. Splitting one HF tensor into disjoint portions and
+   loading those portions into different destination tensors is supported. This assumption does
+   not prohibit replication across different rollout workers.
+
+   - **Consequence of violation — Untested:** loading the same source element into multiple destination
+     locations within a worker is outside the assumed transport configuration. Same-dtype cases can
+     share transfer data, but support across all optimized paths is not established. Mixed-dtype
+     destinations additionally encounter current fused-copy restrictions.
+2. **All receivers agree on the wire dtype for a shared HF name.** The gathered per-name dtype maps
+   must agree; see `_canonical_dtype_spec` in [router.py](../wbridge/backend/router.py).
+   Mixed-precision training and inference, where corresponding trainer and rollout weights use
+   different dtypes, is therefore unsupported.
+
+   - **Consequence of violation — Failure:** inconsistent per-rank dtypes are rejected at metadata gathering.
+
+## Limitations
+
+1. **Persistent RDMA buffers consume GPU memory.** WeightBridge allocates RDMA buffers at connection
+   setup and retains them across updates, reducing the GPU memory available to the runtime. Buffer
+   sizing can be configured manually through `WBRIDGE_ROUND_CAP_BYTES` and the related
+   [buffer settings](environment.md#planning-buffers-and-scheduling). Smaller buffers reduce memory
+   consumption but require more transfer rounds, increasing weight-update latency. The round cap
+   controls per-round payload size, not the total allocation across all buffers.
+2. **Weight updates synchronize inference engines even in asynchronous modes.** WeightBridge currently
+   synchronizes all inference engines during weight updates. Asynchronous execution can overlap
+   parts of weight transfer with computation, but the exchange stages still block inference
+   computation; weight updates are not fully overlapped with generation.
 
 ## Pitfalls
 
 ### 1. The in-process receiver must enter every step in lockstep
-The receiver is a thread inside each rollout worker process, not a separate process. If model-parallel
+The receiver is a thread inside each rollout worker process, not a separate process. If
 ranks enter WeightBridge's blocking step at different times, one rank can be inside a WeightBridge
 collective while another is still inside your runtime's own TP/EP collective → two communicators
 entered in opposite order → a **silent, intermittent deadlock**. **Avoid:**
-drive `poll_requests()` on **all** ranks every tick via rank 0's hub broadcast
+drive `poll_requests()` on **all** ranks every inference step via rank 0's hub broadcast
 (the built-in behavior) — never per-rank/self-scheduled, and keep the control notification on the main
 thread. This is *the* headline constraint.
 
-### 2. Never pause the rollout engine around the transfer
-A "pause generation" bracket inside the update path deadlocks the flag handshake (a paused receiver
-won't complete its lockstep role); `pause`/`flush` return 200 OK, masking it. **Avoid:** enforce
-on-policy freshness by draining in-flight rollouts at the orchestration layer *before* the update.
+### 2. Be cautious when pausing the rollout engine
+If you pause the rollout engine, make sure `poll_requests()` remains reachable on all ranks
+while paused. This lets connection setup and weight updates progress; a pause that prevents
+polling can block the transfer handshake.
 
 ### 3. Mooncake on EFA
 - **Mooncake must be built with EFA support.** Mooncake is the default RDMA backend; on an EFA fabric
@@ -108,7 +154,7 @@ a usable error** — a hang, or a panic that is not an exception.
   per GPU, striping is worth more than that margin.
 - **Bring-up quirks** — mesh transport configuration, passing peer meshes as constructor arguments,
   awaiting mesh initialization before pickling — belong to the orchestration layer rather than the
-  transport; see [examples](examples.md#orchestrator-monarch-default-or-ray).
+  transport; see [examples](examples.md#orchestrator-ray-default-or-monarch).
 
 ### 5. Transport performance traps
 Latent in any backend whose completions are delivered through Python, and both are easy to measure past.
@@ -132,7 +178,7 @@ Latent in any backend whose completions are delivered through Python, and both a
 
 ### 6. De-duplication correctness
 Replica-aware transfer is subtle; the built-in implementation handles it, but if you touch it:
-receiver dedup must key on the **whole** receive spec (not per-tensor), consume must use an
+receiver dedup classes must use each tensor name's **complete canonical shard set**, consume must use an
 **intersection** mapping (a partial `1/m` slice is not "contained"), the receiver↔receiver exchange
 must preserve exact source ownership, and reused external ingress slots need an aggregate
 **consumed-flag** handshake (a fast writer must not overwrite a slot until self and every local
@@ -147,7 +193,6 @@ Reductions must be deterministic across ranks (sorted keys) or the flag ping-pon
 - **Split shards on a contiguous axis.** Splitting the longest axis of a wide tensor yields strided
   sub-shards and a substantially slower copy kernel. (Correctness-neutral, large perf trap; the planner
   auto-picks contiguous vs. strided.)
-- **Multi-destination HF names use the widest destination dtype** for the wire buffer.
 
 ### 8. Ordering & synchronization
 - There is no transport notify primitive: cross-node "done"/"consumed" signals are tiny flag writes the
@@ -167,9 +212,7 @@ Tune `WBRIDGE_ROUND_CAP_BYTES` to free HBM; allocations near 80% of the remainin
 Keep logical/pack buffers transient or fused — don't cache many persistent ones. Real-weight validation can also hit a **cgroup** memory limit
 (not host OOM) mid-registration; lean the config if so.
 
----
-
-## Validation — a green run is not a successful transfer
+### Validation — a green run is not a successful transfer
 
 The single most dangerous failure class is a **silent no-op** (zero-transfer from a libfabric conflict,
 or a swallowed transport return code). Do not trust timings or exit codes alone:
@@ -185,31 +228,3 @@ or a swallowed transport return code). Do not trust timings or exit codes alone:
   thing while looking healthy.
 - Benchmark **steady state**, not the first transfer — connect, registration, and warmup impose a large
   one-time cost, while later transfers stabilize.
-
----
-
-## Current simplifications
-
-These are implementation choices, not fundamental limits:
-
-- **Transfers are split into byte-capped rounds, run in sequence.** Within a round, packing and consume
-  are *fully fused* — the transpose-aware model↔wire copy (both packing stages collapsed into one plan)
-  replays as O(1) Triton launches per dtype group, not tensor-by-tensor. The remaining granularity is
-  the round: a transfer is chunked to `WBRIDGE_ROUND_CAP_BYTES` (default 2 GiB) and the cap must be
-  sized to the rollout's free HBM (wire buffers are double-buffered, the dedup arena scales with the
-  cap; see the Memory / OOM pitfall above).
-- **Pipelining is partial.** The sender's RDMA overlaps the next training step (background thread +
-  double-buffered wire buffers), and on the receiver the sender's RDMA-fill of the next round's landing
-  zone overlaps current work (the zones are disjoint). The depth-2/3-stage dispatcher may keep both prepared
-  parity rounds' E+C work active; exact per-destination generation gates serialize only reuse of the same
-  stable slot, while source-slot kernels remain readiness-driven and independent. The **pack runs synchronously on the
-  caller's thread**, so its cost sits on the training critical path. Optional CPU **staging** (off by default) overlaps the
-  transfer with generation at the cost of substantially lower host-RDMA bandwidth; the validated default transfers
-  straight from GPU.
-- **Cross-engine / data-parallel matching is the caller's responsibility.** The router computes shard
-  overlaps and deduplicates *within* a replica class, but does not infer cross-engine replica
-  equivalence or decide which trainer ranks feed which rollout engine. A tensor replicated wider than
-  its class is under-deduplicated (sent more than once) — never incorrect, just less bandwidth saved.
-- **Teardown relies on process death** (daemon threads + the coordinator's parent-death watchdog); there
-  is no wired-in graceful shutdown — call `WeightReceiver.stop()` and terminate the coordinator `Popen`
-  if you need one.

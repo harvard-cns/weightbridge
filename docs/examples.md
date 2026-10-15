@@ -125,7 +125,7 @@ Reading `workers.py` against [integration.md](integration.md):
   `coordinator.spawn(ipc, port)` once; workers connect their `ReceiverAdapter` to the same IPC.
 - **Receiver polling** — `RolloutWorker.recv_weights` loops on `poll_requests()`; a production runtime
   passes `before_receive` to quiesce local inference before weights are mutated
-  (the example polls until ready; a real engine calls this once per scheduler tick, on all ranks).
+  (the example polls until ready; a real engine calls this once per inference step, on all ranks).
 - **Sender** — `TrainerWorker` builds `SenderArgs` with `receiver_urls=["tcp://host:rollout_port"]`,
   constructs a `SenderAdapter`, calls `connect()` once, then `send_weights()`.
 - **Rank rules** — `num_workers=num_rollout_workers` and per-worker `rank` (the toy is TP-only, so

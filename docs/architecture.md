@@ -28,14 +28,14 @@ flowchart LR
         CO["ZMQ relay<br/>TCP (trainer-facing) ⇄ IPC (rank0-facing)"]
     end
 
-    subgraph RolloutEngine["Rollout Engine (one process per model-parallel rank)"]
+    subgraph RolloutEngine["Rollout Engine (one process per rank)"]
         R0["Rollout Worker 0<br/>ReceiverAdapter → WeightReceiver"]
         RM["Rollout Worker M<br/>ReceiverAdapter → WeightReceiver"]
     end
 
     T0 -- "ZMQ world_query / connect (rank 0)" --> CO
     CO -- "IPC connect_request" --> R0
-    R0 -- "hub KICK / GO broadcast (per tick, lockstep)" --> RM
+    R0 -- "hub KICK / GO broadcast (per inference step, lockstep)" --> RM
     T0 -- "one-time Gloo all_gather (specs, buffer addrs)" --> R0
     T0 == "one-sided RDMA writes + flag ping-pong (bytes)" ==> R0
     TN == "one-sided RDMA writes + flag ping-pong (bytes)" ==> RM
@@ -63,11 +63,10 @@ computes the same addresses with no handshake or environment handoff:
 - coordinator TCP (trainer-facing): `coordinator_tcp_port(port)`
 - rank0 ⇄ peers hub: `hub_addr(port)`
 
-Inside a Rollout Engine, rank 0 owns a **hub** (a ZMQ star) to the other model-parallel ranks. Every
-scheduler tick, rank 0 turns its local input flag state into one decision and **broadcasts it to all
+Inside a Rollout Engine, rank 0 owns a **hub** (a ZMQ star) to the other ranks. Every
+inference step, rank 0 turns its local input flag state into one decision and **broadcasts it to all
 peers, which block for it**. RS uses two decisions: KICK wakes CPU receive workers without stopping
-generation; GO quiesces every TP rank after rank 0's first GPU ingress round is ready. This per-tick
-lockstep keeps all model-parallel ranks entering blocking steps together — see
+generation; GO quiesces every TP rank after rank 0's first GPU ingress round is ready. This lockstep at each inference step keeps all ranks entering blocking steps together — see
 [Threading model](#threading-model).
 
 After GO, a peer may still be waiting for its own GPU ingress flag. There is no engine-wide exchange
@@ -106,10 +105,10 @@ parameters and yours, which byte ranges do I need to send you?*
   It can represent the transformations mainstream loaders perform: QKV merge, gate/up merge,
   row/column-parallel slices, vocab slices, expert stacking, and transpose.
 - WeightBridge **infers** a `LoadSpec` by *symbolically probing the runtime's own `load_weights`
-  function* (see [`specgen`](api.md#metadata-helpers)): it feeds structured index-placeholder tensors
+  function* (see [`specgen`](integration.md#metadata-helpers)): it feeds structured index-placeholder tensors
   through the loader, observes which worker elements they land in, and recovers axis-aligned shard
   boxes. This relies on `load_weights` being a **pure, bijective copy/scatter** for same-dtype
-  elements — no arithmetic on values (see [limitations](limitations.md#loadspec-inference)).
+  elements — no arithmetic on values (see [limitations](limitations.md#loadspec-extraction)).
 - **`ShardSpec`** is the storage-free view derived from `LoadSpec`: which HF-coordinate regions a
   process owns (sender) or needs (receiver).
 
@@ -246,12 +245,12 @@ worker; set the threshold to `0` to retain the natural replica classes.
 This is the crux of a correct integration, so it is worth stating precisely.
 
 - The **receiver is an in-process object living inside each Rollout Worker process** — one per
-  model-parallel rank — **not** a separate process. The only separate process is the coordinator.
+  rank — **not** a separate process. The only separate process is the coordinator.
 - **Readiness decisions and weight consumption run on the Rollout Worker's main (scheduler) thread**,
-  synchronously, inside `poll_requests()`. Every tick, rank 0 non-blockingly peeks
+  synchronously, inside `poll_requests()`. Every inference step, rank 0 non-blockingly peeks
   its CPU-resident first-round sequence, decides, and broadcasts over the hub; every peer observes the
   same decision. The coordinator intake thread remains for connect and the zero-input fallback.
-- This **per-tick, rank0-broadcast lockstep is mandatory**: it guarantees all model-parallel ranks
+- This **lockstep through rank 0 broadcasts at each inference step is mandatory**: it guarantees all ranks
   enter any blocking step together. A decentralized, per-rank, self-scheduled receiver deadlocks —
   one rank enters WeightBridge's step while another is still inside the inference runtime's *own* TP/EP
   collective, and two communicators get entered in opposite order across ranks (a silent circular
