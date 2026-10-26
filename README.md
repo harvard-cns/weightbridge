@@ -11,6 +11,8 @@ then plans and executes transfers that avoid redundant communication and balance
 A small, general API lets RL frameworks integrate weight transfer while retaining control of training
 and rollout scheduling. See our [paper](https://arxiv.org/abs/2609.25442) for the design and evaluation.
 
+See the [Installation Guide](docs/installation.md) for setup and optional dependencies.
+
 ## Why WeightBridge?
 
 - **Bandwidth-efficient.** Replaces all-gather/broadcast weight sync with shard-routed, deduplicated,
