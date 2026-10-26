@@ -1,6 +1,13 @@
 # Installation
 
-WeightBridge installs as the distribution `weightbridge` and is imported as `wbridge`. Dependency declarations are in [pyproject.toml](../pyproject.toml).
+WeightBridge installs as the distribution `wbridge` and is imported as `wbridge`. Dependency declarations are in [pyproject.toml](../pyproject.toml).
+
+Released versions are on PyPI (the name `weightbridge` there belongs to an unrelated project):
+
+```bash
+pip install wbridge                        # base
+pip install 'wbridge[mooncake,cuda]'       # with the Mooncake transport and CUDA IPC support
+```
 
 ## Prerequisites
 
@@ -8,7 +15,7 @@ Use Python 3.10 or newer. Install the PyTorch build appropriate for your GPUs an
 
 Install dependencies on every worker node. Python extras do not provision GPU drivers, NICs, or an EFA fabric.
 
-## Base installation
+## Base installation (from source)
 
 Run from the repository root:
 
