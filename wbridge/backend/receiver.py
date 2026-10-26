@@ -30,6 +30,7 @@ writes finish. A persistent retirement worker keeps PREP lifetime accounting and
 notification off that blocking path.
 """
 
+import json
 import logging
 import os
 import queue
@@ -149,6 +150,9 @@ class WeightReceiver(WBEndpoint):
         # on the main thread — that is what preserves TP lockstep).
         self._controller_ipc_name = controller_ipc_name
         self._ext_req: Optional[dict[str, Any]] = None
+        # Metadata of the update being received (or last received); see poll_requests.
+        self.update_metadata: Any = None
+        self._fallback_metadata: Any = None
         self._ext_lock = threading.Lock()
         self._ext_cv = threading.Condition(self._ext_lock)
         self._stop = False
@@ -721,6 +725,8 @@ class WeightReceiver(WBEndpoint):
             self._pending = None
             return False
         if kind == RECEIVE_REQUEST:
+            # Visible to the caller's before_receive hook and after poll_requests returns True.
+            self.update_metadata = decision.get("metadata")
             broadcast_t0 = decision.get("_gantt_broadcast_t0")
             if broadcast_t0 is not None:
                 gantt.rec(
@@ -755,10 +761,12 @@ class WeightReceiver(WBEndpoint):
             and req.get("type") == RECEIVE_REQUEST
             and self._first_active_round() is None
         )
+        if fallback:
+            self._fallback_metadata = req.get("metadata")
         if not staged:
             ready = fallback or self._sender_input_ready(self._epoch)
             return (
-                {"type": RECEIVE_REQUEST, "epoch": self._epoch}
+                self._receive_decision(self._epoch)
                 if ready
                 else {"type": EMPTY}
             )
@@ -774,10 +782,33 @@ class WeightReceiver(WBEndpoint):
             kicked = self._rs_kicked == self._epoch
             gpu_ready = self._rs_gpu_ready == self._epoch
         return (
-            {"type": RECEIVE_REQUEST, "epoch": self._epoch}
+            self._receive_decision(self._epoch)
             if (kicked and gpu_ready)
             else {"type": EMPTY}
         )
+
+    def _receive_decision(self, epoch: int) -> dict[str, Any]:
+        """Rank 0's GO for *epoch*, carrying the senders' update metadata (if any) to every peer."""
+        decision: dict[str, Any] = {"type": RECEIVE_REQUEST, "epoch": epoch}
+        metadata = self._update_metadata_of(epoch)
+        if metadata is not None:
+            decision["metadata"] = metadata
+        return decision
+
+    def _update_metadata_of(self, epoch: int) -> Any:
+        """Metadata the senders attached to *epoch*, or ``None``.
+
+        It sits in the inbox slot of a sender contributing to rank 0's first active round: every such
+        sender's DATA-ready flag has been observed by now, and each lands its metadata before that flag.
+        A rank 0 without trainer input got it on the coordinator doorbell instead.
+        """
+        ri = self._first_active_round()
+        if ri is None:
+            return getattr(self, "_fallback_metadata", None)
+        if getattr(self, "_meta_buf", None) is None:
+            return None
+        payload = self._read_update_metadata(min(self.router.local_rounds[ri][1]), epoch)
+        return None if payload is None else json.loads(payload)
 
     def poll_requests(
         self, before_receive: Callable[[int], None] | None = None
@@ -787,6 +818,8 @@ class WeightReceiver(WBEndpoint):
         ``before_receive`` runs on every receiver rank after a real weight-update request has been
         selected, but before any model weight is mutated.  Its argument is the update epoch.  It is not
         called for an empty poll, a receiver-staging KICK, or the one-time connection request.
+        :attr:`update_metadata` already holds the metadata the trainer passed to ``send`` for that update
+        (``None`` if it passed none) when the hook runs, and keeps it after this method returns ``True``.
 
         Returns ``True`` only after a weight update has been received and loaded.  Connection setup and
         polls without a completed update return ``False``.  Like the former two-call adapter sequence,

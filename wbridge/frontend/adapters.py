@@ -201,13 +201,17 @@ class SenderAdapter(BaseAdapter):
     def connect(self) -> None:
         self.sender.connect()
 
-    def send_weights(self) -> "torch.cuda.Event | None":
+    def send_weights(self, metadata: object = None) -> "torch.cuda.Event | None":
         """Pack (+ CPU offload under sender-staging) and hand the RDMA to the sender's Stage-2 thread.
 
         Returns the CUDA event marking pack+offload completion (model weights safe to overwrite). The
         caller waits it (standard) or defers the wait until just before it overwrites the weights.
+
+        ``metadata`` (optional, JSON-serializable, at most ``WBRIDGE_METADATA_BYTES`` - 16 bytes encoded)
+        travels with this update's control signal; receivers read it from
+        :attr:`ReceiverAdapter.update_metadata`. Pass the same value on every trainer rank.
         """
-        return self.sender.send()
+        return self.sender.send(metadata)
 
     def wait_send_complete(self) -> None:
         """Block until the last :meth:`send_weights` has been delivered+consumed by all receivers.
@@ -265,6 +269,15 @@ class ReceiverAdapter(BaseAdapter):
         empty polls, staging kicks, and connection setup return ``False``.
         """
         return self.receiver.poll_requests(before_receive=before_receive)
+
+    @property
+    def update_metadata(self) -> object:
+        """Metadata the trainer passed to ``send_weights`` for the update being received.
+
+        Set before ``before_receive`` runs and kept after :meth:`poll_requests` returns ``True``;
+        ``None`` when the trainer passed none.
+        """
+        return self.receiver.update_metadata
 
     def flush_profile_outputs(self) -> None:
         """Release the latest epoch's profiling output after the caller records rollout ``block_end``."""

@@ -1224,8 +1224,13 @@ class WeightSender(WBEndpoint):
         self._epoch += 1
         return returned_event
 
-    def send(self) -> "torch.cuda.Event | None":
+    def send(self, metadata: object = None) -> "torch.cuda.Event | None":
         """Pack (+ CPU offload for sender-staging) on this thread; RDMA on the persistent Stage-2 thread.
+
+        ``metadata`` is an optional JSON-serializable value delivered with this update: it lands in each
+        receiver's inbox before this epoch's first DATA-ready flag, and receiver rank 0 forwards it to its
+        peers in the update decision, where :attr:`WeightReceiver.update_metadata` exposes it. Pass the
+        same value on every sender rank; receivers read it from one of their contributing senders.
 
         Returns a :class:`torch.cuda.Event` that fires when packing (+ the CPU offload, under SS) is
         complete — i.e. the model weights are safe to overwrite. The GPU->remote (SS-off) or CPU->remote
@@ -1241,7 +1246,10 @@ class WeightSender(WBEndpoint):
             or self.device is None
         ):
             raise RuntimeError("WeightSender.send requires connect() first")
+        payload = None if metadata is None else json.dumps(metadata).encode("utf-8")
         if getattr(self, "_relay_enabled", False):
+            if payload is not None:
+                raise NotImplementedError("update metadata is not supported with WBRIDGE_REPLICA_RELAY=1")
             return self._relay_send()
 
         wt = self._epoch
@@ -1261,6 +1269,11 @@ class WeightSender(WBEndpoint):
             self._completed = set()
         self._offload_ev = {}
 
+        if payload is not None:
+            # The previous epoch has drained, so every receiver has already read its slot for that epoch.
+            with gantt.span("sender", self._rank, wt, "metadata_write", 0):
+                self._write_update_metadata(wt, payload)
+
         if self.rank == 0 and self._fallback_receive_engines:
             with gantt.span("sender", self._rank, wt, "receive_post", 0):
                 self._trace_state(
@@ -1268,8 +1281,11 @@ class WeightSender(WBEndpoint):
                     epoch=wt,
                     engines=self._fallback_receive_engines,
                 )
+                doorbell = {"type": RECEIVE}
+                if metadata is not None:
+                    doorbell["metadata"] = metadata
                 for i in self._fallback_receive_engines:
-                    self._coord[i].send(json.dumps({"type": RECEIVE}).encode("utf-8"))
+                    self._coord[i].send(json.dumps(doorbell).encode("utf-8"))
                 for i in self._fallback_receive_engines:
                     d = self._coord[i]
                     reply = self._coord_recv(d, timeout_s=600.0)

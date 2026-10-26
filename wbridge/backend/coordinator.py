@@ -137,7 +137,10 @@ class WeightReceiverController:
             )
             return {"status": "success" if self._gather_ack() else "error"}
         if t == RECEIVE:
-            self._send_to_rank0({"type": RECEIVE_REQUEST})
+            relayed = {"type": RECEIVE_REQUEST}
+            if req.get("metadata") is not None:
+                relayed["metadata"] = req["metadata"]
+            self._send_to_rank0(relayed)
             return {"status": "success" if self._gather_ack() else "error"}
         return {"status": "error", "error": f"unknown request type {t!r}"}
 

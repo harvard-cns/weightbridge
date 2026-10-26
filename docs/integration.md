@@ -185,6 +185,28 @@ context fails loudly at build time, not silently at transfer time.
 10. **Rollout:** nothing extra — the sender's first data-ready flag wakes rank 0, and the poll from step 4
     applies the update. There is no normal per-update trainer→coordinator doorbell.
 
+### Per-update metadata
+
+To tag an update with application state — typically the trainer's weight version — pass a
+JSON-serializable value to `send_weights(metadata=...)` on every trainer rank, and read
+`adapter.update_metadata` on the rollout side:
+
+```python
+ev = adapter.send_weights(metadata={"weight_version": step})          # trainer, every rank
+
+def before_receive(epoch):                                             # rollout, every rank
+    quiesce_and_cancel_requests(epoch)
+    pending_version[0] = adapter.update_metadata["weight_version"]
+```
+
+The metadata rides the update's control signal rather than a separate message: each sender lands it in a
+small pinned inbox slot on every receiver it feeds, waiting for that write to complete before it publishes
+any data-ready flag of the update, so the flag that wakes rank 0 also proves the metadata has arrived.
+Rank 0 reads it from a contributing sender's slot and puts it in the GO decision it broadcasts, so every
+rank sees the same value before `before_receive` runs; it stays readable after `poll_requests()` returns
+`True`. Updates sent without metadata leave it `None` and keep the plain GO decision. The encoded value
+must fit in `WBRIDGE_METADATA_BYTES` minus 16 bytes; it is not supported with `WBRIDGE_REPLICA_RELAY=1`.
+
 ### EWTT measurement hooks
 
 For an end-to-end weight-transfer measurement, use application-owned structured events around the two
@@ -290,9 +312,10 @@ Trainer-side integration. Construction runs `LoadSpec` inference + verification 
 
 - `connect() -> None` — queries each coordinator, joins the Gloo rendezvous, registers RDMA buffers,
   starts the background RDMA thread. Call **once**; reuse for all updates.
-- `send_weights() -> torch.cuda.Event | None` — packs on the calling thread, hands RDMA to the
+- `send_weights(metadata=None) -> torch.cuda.Event | None` — packs on the calling thread, hands RDMA to the
   background thread, returns an event that fires when the packed weights are safe to overwrite. One
-  call = one update.
+  call = one update. `metadata` is an optional JSON-serializable value delivered to the receivers with
+  this update (see [Per-update metadata](#per-update-metadata)); pass the same value on every rank.
 - `wait_send_complete() -> None` — blocks until the last update is delivered and consumed by all
   receivers. Only needed for debug/equality checks; production skips it so RDMA overlaps the next step.
 - `flush_profile_outputs() -> None` — release Gantt/control profiling output for the latest epoch. Call
@@ -314,6 +337,9 @@ Rollout-side integration. Construction runs `LoadSpec` inference + verification 
   `consume_end` immediately after `poll_requests()` returns `True`. Across a distributed deployment,
   EWTT is the earliest trainer `send_start` to the latest rollout-rank `consume_end`. Use a cross-host
   wall clock for those endpoints; a process-local monotonic clock cannot be subtracted across nodes.
+- `update_metadata` — the `metadata` the trainer passed to `send_weights` for the update being received:
+  set before `before_receive(epoch)` runs and kept after `poll_requests()` returns `True`; `None` if the
+  trainer passed none.
 - `flush_profile_outputs() -> None` — release Gantt JSONL, control-profile logs, and a requested receiver
   chrome trace for the latest epoch. Call after recording rollout `block_end`.
 - `num_workers` is the number of worker processes in the inference engine; `receiver_staging` enables the

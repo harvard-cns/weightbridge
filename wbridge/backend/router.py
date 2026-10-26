@@ -2369,6 +2369,19 @@ class WeightRouter:
         )
 
 
+# Update metadata travels in a per-sender inbox slot next to the receiver's flag words:
+# [epoch + 1 (int64), payload bytes (int64), JSON payload]. Senders always write the whole slot.
+_UPDATE_METADATA_HEADER = struct.Struct("<qq")
+
+
+def update_metadata_slot_bytes() -> int:
+    """Bytes of one sender's metadata slot (header included); ``WBRIDGE_METADATA_BYTES``, default 4096."""
+    size = int(os.environ.get("WBRIDGE_METADATA_BYTES", "4096"))
+    if size <= _UPDATE_METADATA_HEADER.size:
+        raise ValueError(f"WBRIDGE_METADATA_BYTES={size} leaves no room for a payload")
+    return size
+
+
 class WBEndpoint:
     """Shared RDMA endpoint base for Trainer Worker senders and Rollout Worker receivers.
 
@@ -2753,6 +2766,8 @@ class WBEndpoint:
         self._cpu_recv = None  # RS: full-depth CPU receive arena
         self._flag_buf = None
         self._flag_src = None
+        self._meta_buf = None
+        self._meta_src = None
         # Drop same-node CUDA-IPC state so a reconnect re-imports against the freshly reallocated arena (torch
         # GC closes the imported mem/event handles). Guarded — these exist only for receivers with class peers.
         self._repl_peer_arena = {}
@@ -3478,6 +3493,7 @@ class WBEndpoint:
             is_flag=True,
             tensor=self._flag_src,
         )
+        self._setup_update_metadata_buffers(n)
 
         # NUMA node of the pinned bulk NIC (-1 if unpinned): the big host staging buffers below are allocated
         # first-touch-local to it so the NIC's DMA isn't cross-socket (a major host-RDMA throughput lever).
@@ -4064,6 +4080,11 @@ class WBEndpoint:
             for i in range(self._flag_buf.numel())
         ]
         if not self._is_sender:
+            mb = self._meta_bytes
+            regions += [
+                (self._meta_buf.data_ptr() + i * mb, mb)
+                for i in range(self._meta_buf.numel() // mb)
+            ]
             if self._repl_peers:
                 regions += [
                     (self._repl_flag_buf.data_ptr() + i * fi, fi)
@@ -4106,6 +4127,9 @@ class WBEndpoint:
             "flag_addr": self._flag_buf.data_ptr(),
             "flag_slot_of": self.flag_slot_of,
             "flag_rounds": self.num_rounds,
+            # Update-metadata inbox (receivers; 0 on senders), one slot per sender at its flag slot index.
+            "meta_addr": self._meta_buf.data_ptr() if not self._is_sender else 0,
+            "meta_bytes": self._meta_bytes,
             # Arena base (0 on senders). Class peers add the absolute shared-bank grecv offset computed by
             # arena_layout; own/send offsets still receive their local round-parity base at the source.
             "arena_addr": self._arena.data_ptr() if not self._is_sender else 0,
@@ -4193,6 +4217,7 @@ class WBEndpoint:
         self._merged_recv_pred: dict[int, dict[int, int | None]] = {}
         self._merged_recv_last: dict[int, dict[int, int]] = {}
         self._flag_dst: dict[int, int] = {}
+        self._meta_dst: dict[int, int] = {}
         for peer in self.peers:
             pinfo = all_info[peer]
             self.peer_session[peer] = pinfo["session"]
@@ -4209,6 +4234,13 @@ class WBEndpoint:
                 pinfo["flag_addr"] + slot * self.num_rounds * self._FLAG_ITEMSIZE
             )
             if self._is_sender:
+                if pinfo.get("meta_bytes") != self._meta_bytes:
+                    raise RuntimeError(
+                        f"update-metadata slot size mismatch with peer {peer}: "
+                        f"local={self._meta_bytes} remote={pinfo.get('meta_bytes')} "
+                        "(set WBRIDGE_METADATA_BYTES identically on both sides)"
+                    )
+                self._meta_dst[peer] = pinfo["meta_addr"] + slot * self._meta_bytes
                 # Use the receiver's PUBLISHED per-round RECV offsets (RS-aware) rather than recomputing the
                 # layout locally — so the same sender code targets a GPU arena (RS-off) or a full-depth CPU
                 # arena (RS-on) transparently.
@@ -5841,6 +5873,56 @@ class WBEndpoint:
             self._flag_reaper_ensure()
             assert self._flag_reaper_q is not None
             self._flag_reaper_q.put((handle, kind, peer, seq))
+
+    def _setup_update_metadata_buffers(self, num_peer_slots: int) -> None:
+        """Allocate and register the update-metadata inbox (receiver) or outgoing slot (sender)."""
+        self._meta_bytes = update_metadata_slot_bytes()
+        size = (num_peer_slots if not self._is_sender else 1) * self._meta_bytes
+        buf = torch.zeros(size, dtype=torch.uint8).pin_memory()
+        self.engine.register(buf.data_ptr(), size, is_flag=True, tensor=buf)
+        if self._is_sender:
+            self._meta_buf, self._meta_src = None, buf
+        else:
+            self._meta_buf, self._meta_src = buf, None
+
+    def _write_update_metadata(self, epoch: int, payload: bytes) -> None:
+        """Land *payload* in every receiver peer's inbox slot for this sender, blocking until it has landed.
+
+        Called before any DATA-ready flag of *epoch* is published, so a receiver that observes one of our
+        flags for *epoch* also sees this slot (the same data-before-flag ordering as the bulk writes).
+        """
+        meta_dst = getattr(self, "_meta_dst", None)
+        if self._meta_src is None or meta_dst is None:
+            raise RuntimeError("update metadata is not supported on this connection (replica relay?)")
+        capacity = self._meta_bytes - _UPDATE_METADATA_HEADER.size
+        if len(payload) > capacity:
+            raise ValueError(
+                f"update metadata is {len(payload)} bytes; the slot holds {capacity} "
+                "(raise WBRIDGE_METADATA_BYTES on both sides)"
+            )
+        record = bytearray(_UPDATE_METADATA_HEADER.pack(epoch + 1, len(payload)) + payload)
+        self._meta_src[: len(record)] = torch.frombuffer(record, dtype=torch.uint8)
+        handles = [
+            self.engine.write_async(
+                self.peer_session[peer],
+                [self._meta_src.data_ptr()],
+                [meta_dst[peer]],
+                [self._meta_bytes],
+            )
+            for peer in self.peers
+        ]
+        self.engine.wait([h for h in handles if h is not None])
+
+    def _read_update_metadata(self, peer: int, epoch: int) -> bytes | None:
+        """Payload *peer* wrote for *epoch*, or ``None`` when it sent none (the slot holds another epoch)."""
+        mb = self._meta_bytes
+        base = self.flag_slot_of[peer] * mb
+        raw = self._meta_buf[base : base + mb].numpy().tobytes()
+        tagged_epoch, nbytes = _UPDATE_METADATA_HEADER.unpack_from(raw)
+        if tagged_epoch != epoch + 1:
+            return None
+        start = _UPDATE_METADATA_HEADER.size
+        return raw[start : start + nbytes]
 
     def _flag_emit(self, kind: int, peer: int, seq: int) -> None:
         """Publish ACK/DATA-ready, READY, or CONS with no shared writer queue or completion wait."""
